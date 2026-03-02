@@ -207,16 +207,49 @@ def api_file(filepath):
 
 @app.route("/api/upload", methods=["POST"])
 def api_upload():
-    """Handle file uploads from the UI."""
+    """Handle file uploads from the UI.
+
+    Files are saved to uploads/ AND copied to the project root so the
+    pipeline can reference them. For text-based files, we also read the
+    content so the LLM can see it.
+    """
     UPLOADS_DIR.mkdir(exist_ok=True)
     uploaded = []
+    file_previews = {}
+
     for key in request.files:
         f = request.files[key]
         if f.filename:
-            dest = UPLOADS_DIR / f.filename
+            # Sanitize filename for Windows
+            safe_name = re.sub(r'[\\/:*?"<>|]+', '_', f.filename)
+
+            # Save to uploads/
+            dest = UPLOADS_DIR / safe_name
             f.save(str(dest))
-            uploaded.append(f.filename)
-    return jsonify({"uploaded": uploaded})
+
+            # Also copy to project root so scripts can find it
+            root_copy = ROOT / safe_name
+            if not root_copy.exists():
+                shutil.copy2(str(dest), str(root_copy))
+
+            uploaded.append(safe_name)
+
+            # Read text-based files to provide preview to LLM
+            text_exts = {".txt", ".csv", ".json", ".py", ".md", ".yaml",
+                         ".yml", ".toml", ".ini", ".cfg", ".log", ".tsv",
+                         ".xml", ".html", ".css", ".js", ".c", ".cpp",
+                         ".h", ".sh", ".sql", ".r"}
+            if dest.suffix.lower() in text_exts:
+                try:
+                    content = dest.read_text(encoding="utf-8", errors="replace")
+                    # Truncate large files
+                    if len(content) > 5000:
+                        content = content[:5000] + "\n... (truncated)"
+                    file_previews[safe_name] = content
+                except Exception:
+                    pass
+
+    return jsonify({"uploaded": uploaded, "previews": file_previews})
 
 
 # ---------------------------------------------------------------------------
@@ -248,9 +281,10 @@ def on_run_pipeline(data):
     headless = data.get("headless", False)
     attachments = data.get("attachments", [])
 
-    # If there are attached files, mention them in the prompt context
+    # If there are attached files, mention them cleanly in the prompt
+    # (no newlines or brackets that could break filename slugging)
     if attachments:
-        attachment_note = "\n\n[Attached files: " + ", ".join(attachments) + "]"
+        attachment_note = " (Attached files: " + ", ".join(attachments) + ")"
         prompt += attachment_note
 
     sid = request.sid
@@ -1050,33 +1084,51 @@ function updateStatus(state) {
     send.disabled = state === 'running';
 }
 
-function sendPrompt() {
+async function sendPrompt() {
     const input = document.getElementById('promptInput');
     const prompt = input.value.trim();
     if (!prompt || isRunning) return;
 
-    // Upload any attached files first
+    let fileNames = [];
+    let fileContext = '';
+
+    // Upload any attached files first and get previews
     if (attachedFiles.length > 0) {
         const formData = new FormData();
         attachedFiles.forEach((f, i) => formData.append('file_' + i, f));
-        fetch('/api/upload', { method: 'POST', body: formData });
+        try {
+            const res = await fetch('/api/upload', { method: 'POST', body: formData });
+            const data = await res.json();
+            fileNames = data.uploaded || [];
+            // Build file context from previews so LLM can see file contents
+            const previews = data.previews || {};
+            for (const [name, content] of Object.entries(previews)) {
+                fileContext += '\\n\\nContents of ' + name + ':\\n```\\n' + content + '\\n```';
+            }
+        } catch(e) { console.error('Upload failed:', e); }
+    }
+
+    // Build the full prompt with file context
+    let fullPrompt = prompt;
+    if (fileContext) {
+        fullPrompt += fileContext;
     }
 
     // Hide welcome
     const welcome = document.getElementById('welcome');
     if (welcome) welcome.style.display = 'none';
 
-    // Add user message
+    // Add user message (show just the typed prompt, not the file content)
     addUserMessage(prompt);
 
     // Send to server
     socket.emit('run_pipeline', {
-        prompt: prompt,
+        prompt: fullPrompt,
         target: document.getElementById('targetSelect').value,
         max_retries: document.getElementById('retriesInput').value,
         timeout: document.getElementById('timeoutInput').value,
         headless: document.getElementById('headlessSelect').value === 'headless',
-        attachments: attachedFiles.map(f => f.name),
+        attachments: fileNames,
     });
 
     // Clear input

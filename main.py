@@ -868,19 +868,33 @@ def run_pipeline(prompt: str, target: str = None, max_retries: int = 3,
 # CLI
 # ---------------------------------------------------------------------------
 
+def launch_ui():
+    """Launch the web UI. Imports ui.py from the same directory."""
+    ui_path = ROOT / "ui.py"
+    if not ui_path.exists():
+        print("[ERROR] ui.py not found in project root.")
+        print("  Download ui.py and place it next to main.py.")
+        sys.exit(1)
+    # Run ui.py as a subprocess so it gets its own clean process
+    subprocess.run([sys.executable, str(ui_path)])
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Agent v2: LLM-driven software/hardware loop",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
+            "  python main.py                          # Launch web UI\n"
             '  python main.py "make a random word generator for raspi"\n'
             '  python main.py "write fizzbuzz" --target local\n'
             '  python main.py "why is I2C not working" --max-retries 5\n'
             '  python main.py "blink GPIO 17" --headless\n'
         ),
     )
-    parser.add_argument("prompt", help="What you want done (natural language)")
+    parser.add_argument("prompt", nargs="?", default=None,
+                        help="What you want done (natural language). "
+                             "If omitted, launches the web UI.")
     parser.add_argument("--target", choices=["local", "raspi"], default=None,
                         help="Force target (default: auto-detect from prompt)")
     parser.add_argument("--headless", action="store_true",
@@ -893,6 +907,8 @@ def main():
                         help="Working directory on Pi (default: ~/Documents)")
     parser.add_argument("--login", action="store_true",
                         help="Open browser for manual ChatGPT login")
+    parser.add_argument("--cli", action="store_true",
+                        help="Force CLI mode (skip UI even with no prompt)")
 
     args = parser.parse_args()
 
@@ -900,6 +916,14 @@ def main():
         from skills.chatgpt_skill import run_login_mode
         run_login_mode()
         return
+
+    # No prompt and not --cli -> launch web UI
+    if args.prompt is None and not args.cli:
+        launch_ui()
+        return
+
+    if args.prompt is None:
+        parser.error("prompt is required in CLI mode (--cli)")
 
     run_pipeline(
         prompt=args.prompt,
