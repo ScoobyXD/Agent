@@ -179,14 +179,14 @@ def build_initial_prompt(user_prompt: str, context: str, target: str,
     else:
         exec_env = (
             "- My runner saves your code to a .py file and executes it with Python.\n"
-            "- ALWAYS write Python, even for simple tasks (folders, file ops, git, shell commands).\n"
+            "- Try to write Python, even for simple tasks (folders, file ops, git, shell commands).\n"
             "- Use subprocess.run() for system/shell commands. Use os, shutil, pathlib for file ops.\n"
             "- NEVER write bash/shell scripts -- only Python works here."
         )
 
     return (
         f"=== ROLE ===\n"
-        f"You are helping me debug and write code for hardware.\n"
+        f"You are a helpful agent that helps me write code, solve problems, and cobble together things when I try something new.\n"
         f"Code will be deployed and executed on: {target_desc}.\n"
         f"\n"
         f"=== SYSTEM CONTEXT ===\n"
@@ -196,11 +196,12 @@ def build_initial_prompt(user_prompt: str, context: str, target: str,
         f"{exec_env}\n"
         f"\n"
         f"=== RESPONSE FORMAT ===\n"
-        f"- Put ALL code inside exactly ONE fenced code block (```language\\n...code...\\n```).\n"
+        f"- If you are writing code, put ALL code inside exactly ONE fenced code block (```language\\n...code...\\n```).\n"
         f"- Do NOT put any text after the closing ```. No usage instructions, no \"how to run\", no \"save as\".\n"
         f"- If you need multiple files or steps, combine them into ONE script.\n"
         f"- If you need a package installed, include INSTALL: package1, package2 BEFORE the code block.\n"
         f"- If this will take longer than 30s to run, include TIMEOUT: <seconds> BEFORE the code block.\n"
+        f"- If you are not writing code, lets have a conversation"
         f"\n"
         f"=== RULES ===\n"
         f"- SIMPLICITY FIRST: prefer the simplest, most direct solution. Fewer lines = fewer bugs.\n"
@@ -656,12 +657,20 @@ def save_output(name: str, stdout: str, stderr: str, attempt: int) -> Path:
 
 def run_pipeline(prompt: str, target: str = None, max_retries: int = 3,
                  timeout: int = 30, remote_dir: str = None,
-                 headed: bool = True, profile_dir: Path = None) -> bool:
+                 headed: bool = True, profile_dir: Path = None,
+                 attachments: list = None) -> bool:
     """Main entry point. Prompt -> LLM -> execute -> verify -> retry.
 
     Args:
-        profile_dir: Override browser profile directory. For parallel
-                     agents, pass a unique directory per agent.
+        prompt: Natural language task description.
+        target: 'local', 'raspi', or None for auto-detect.
+        max_retries: Max retry attempts.
+        timeout: Default execution timeout in seconds.
+        remote_dir: Working directory on Pi.
+        headed: Show browser window.
+        profile_dir: Override browser profile directory.
+        attachments: List of local file paths to upload to ChatGPT.
+                     Supports images, CSVs, PDFs, etc.
 
     Returns True if the LLM verified PASS, False otherwise.
     """
@@ -675,6 +684,8 @@ def run_pipeline(prompt: str, target: str = None, max_retries: int = 3,
     print(f"  Target:  {resolved}")
     print(f"  Prompt:  {prompt[:80]}{'...' if len(prompt) > 80 else ''}")
     print(f"  Retries: {max_retries}")
+    if attachments:
+        print(f"  Files:   {len(attachments)} attachment(s)")
     if detach:
         print(f"  Mode:    DETACHED (long-running task)")
     print("=" * 60)
@@ -714,7 +725,8 @@ def run_pipeline(prompt: str, target: str = None, max_retries: int = 3,
             if is_followup:
                 response = session.followup(current_prompt)
             else:
-                response = session.prompt(current_prompt)
+                # First prompt: attach files if any
+                response = session.prompt(current_prompt, files=attachments)
             is_followup = True
 
             # Log response
@@ -869,13 +881,12 @@ def run_pipeline(prompt: str, target: str = None, max_retries: int = 3,
 # ---------------------------------------------------------------------------
 
 def launch_ui():
-    """Launch the web UI. Imports ui.py from the same directory."""
-    ui_path = ROOT / "ui.py"
+    """Launch the web UI from core/ui.py."""
+    ui_path = ROOT / "core" / "ui.py"
     if not ui_path.exists():
-        print("[ERROR] ui.py not found in project root.")
-        print("  Download ui.py and place it next to main.py.")
+        print("[ERROR] core/ui.py not found.")
+        print("  Place ui.py inside the core/ directory.")
         sys.exit(1)
-    # Run ui.py as a subprocess so it gets its own clean process
     subprocess.run([sys.executable, str(ui_path)])
 
 
@@ -888,8 +899,8 @@ def main():
             "  python main.py                          # Launch web UI\n"
             '  python main.py "make a random word generator for raspi"\n'
             '  python main.py "write fizzbuzz" --target local\n'
-            '  python main.py "why is I2C not working" --max-retries 5\n'
-            '  python main.py "blink GPIO 17" --headless\n'
+            '  python main.py "analyze this" --attach data.csv\n'
+            '  python main.py "what is this image" --attach photo.png\n'
         ),
     )
     parser.add_argument("prompt", nargs="?", default=None,
@@ -907,6 +918,9 @@ def main():
                         help="Working directory on Pi (default: ~/Documents)")
     parser.add_argument("--login", action="store_true",
                         help="Open browser for manual ChatGPT login")
+    parser.add_argument("--attach", type=str, action="append", dest="attachments",
+                        metavar="FILE",
+                        help="Attach file(s) to send to ChatGPT (images, CSVs, etc.)")
     parser.add_argument("--cli", action="store_true",
                         help="Force CLI mode (skip UI even with no prompt)")
 
@@ -925,6 +939,19 @@ def main():
     if args.prompt is None:
         parser.error("prompt is required in CLI mode (--cli)")
 
+    # Resolve attachment paths to absolute
+    file_paths = None
+    if args.attachments:
+        file_paths = []
+        for fp in args.attachments:
+            p = Path(fp)
+            if not p.is_absolute():
+                p = Path.cwd() / p
+            if p.exists():
+                file_paths.append(str(p))
+            else:
+                print(f"[WARN] Attachment not found: {fp}")
+
     run_pipeline(
         prompt=args.prompt,
         target=args.target,
@@ -932,6 +959,7 @@ def main():
         timeout=args.timeout,
         remote_dir=args.remote_dir,
         headed=not args.headless,
+        attachments=file_paths,
     )
 
 

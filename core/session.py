@@ -18,7 +18,7 @@ from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 
-from core import selectors as S
+from core import chatgpt_selectors as S
 
 PROFILE_DIR = Path(__file__).resolve().parent.parent / ".browser_profile"
 
@@ -68,14 +68,32 @@ class ChatGPTSession:
 
     # --- Public API ---
 
-    def prompt(self, text: str) -> str:
-        """Send a prompt. Starts a new chat if already in a conversation."""
+    def prompt(self, text: str, files: list = None) -> str:
+        """Send a prompt, optionally with file attachments.
+
+        Args:
+            text: The prompt text.
+            files: List of local file paths to upload to ChatGPT.
+                   Supports images, CSVs, PDFs, code files, etc.
+                   Files are uploaded via ChatGPT's file input before sending.
+
+        Starts a new chat if already in a conversation.
+        """
         if self._in_conversation:
             self.new_chat()
+        if files:
+            self._attach_files(files)
         return self._send_and_wait(text)
 
-    def followup(self, text: str) -> str:
-        """Send a follow-up in the SAME conversation (multi-turn)."""
+    def followup(self, text: str, files: list = None) -> str:
+        """Send a follow-up in the SAME conversation (multi-turn).
+
+        Args:
+            text: The follow-up text.
+            files: Optional list of file paths to attach.
+        """
+        if files:
+            self._attach_files(files)
         return self._send_and_wait(text)
 
     def new_chat(self):
@@ -85,6 +103,83 @@ class ChatGPTSession:
         print("[OK] New chat started.")
 
     # --- Internals ---
+
+    def _attach_files(self, file_paths: list):
+        """Upload files to ChatGPT via its hidden <input type="file">.
+
+        Playwright's set_input_files() works on hidden file inputs without
+        needing to click any buttons. ChatGPT processes the files and shows
+        previews/chips before we type the prompt text.
+        """
+        from pathlib import Path as _Path
+
+        valid_paths = []
+        for fp in file_paths:
+            p = _Path(fp)
+            if p.exists() and p.is_file():
+                valid_paths.append(str(p.resolve()))
+            else:
+                print(f"  [WARN] File not found, skipping: {fp}")
+
+        if not valid_paths:
+            return
+
+        page = self._page
+
+        # Find the hidden file input
+        file_input = None
+        for sel in S.FILE_INPUT_SELECTORS:
+            try:
+                fi = page.query_selector(sel)
+                if fi:
+                    file_input = fi
+                    break
+            except Exception:
+                continue
+
+        if not file_input:
+            # Some ChatGPT layouts hide the input more deeply.
+            # Try waiting briefly for it.
+            try:
+                file_input = page.wait_for_selector(
+                    S.FILE_INPUT_SELECTORS[0],
+                    timeout=5000,
+                    state="attached",  # doesn't need to be visible
+                )
+            except Exception:
+                print("  [WARN] Could not find file upload input. Files not attached.")
+                return
+
+        # Upload all files at once
+        try:
+            file_input.set_input_files(valid_paths)
+            print(f"  [UPLOAD] Sent {len(valid_paths)} file(s) to ChatGPT")
+        except Exception as e:
+            print(f"  [WARN] File upload failed: {e}")
+            return
+
+        # Wait for ChatGPT to process the uploads (show preview/chip)
+        upload_confirmed = False
+        deadline = time.time() + S.FILE_UPLOAD_TIMEOUT
+        while time.time() < deadline:
+            for sel in S.FILE_UPLOAD_COMPLETE_SELECTORS:
+                try:
+                    indicator = page.query_selector(sel)
+                    if indicator and indicator.is_visible():
+                        upload_confirmed = True
+                        break
+                except Exception:
+                    continue
+            if upload_confirmed:
+                break
+            time.sleep(0.5)
+
+        if upload_confirmed:
+            print(f"  [OK] File(s) attached and processed by ChatGPT")
+            time.sleep(1)  # Brief pause for UI to stabilize
+        else:
+            print(f"  [WARN] Could not confirm file upload completed (proceeding anyway)")
+            time.sleep(2)
 
     def _navigate_to_new_chat(self):
         self._page.goto(S.NEW_CHAT_URL, wait_until="domcontentloaded",
@@ -96,17 +191,36 @@ class ChatGPTSession:
     def _send_and_wait(self, text: str) -> str:
         page = self._page
 
-        # Focus and clear textarea
-        textarea = page.wait_for_selector(S.PROMPT_TEXTAREA, timeout=10_000)
-        textarea.click()
-        page.keyboard.press("Control+a")
-        page.keyboard.press("Backspace")
+        # Focus and type into textarea.
+        # After file uploads, the DOM may have reshuffled, making old
+        # ElementHandles stale. Use page.locator() which always re-queries,
+        # and retry if the element detaches mid-interaction.
+        max_focus_attempts = 3
+        for attempt in range(max_focus_attempts):
+            try:
+                # Use locator (auto-retries) instead of ElementHandle
+                textarea = page.locator(S.PROMPT_TEXTAREA)
+                textarea.wait_for(state="visible", timeout=10_000)
+                textarea.click()
+                time.sleep(0.3)
 
-        # Type (fast fill for long prompts)
-        if len(text) > 500:
-            textarea.fill(text)
-        else:
-            textarea.type(text, delay=S.TYPING_DELAY_MS)
+                # Clear any existing text
+                page.keyboard.press("Control+a")
+                page.keyboard.press("Backspace")
+                time.sleep(0.2)
+
+                # Type (fast fill for long prompts)
+                if len(text) > 500:
+                    textarea.fill(text)
+                else:
+                    textarea.type(text, delay=S.TYPING_DELAY_MS)
+                break  # success
+            except Exception as e:
+                if attempt < max_focus_attempts - 1:
+                    print(f"  [RETRY] Textarea interaction failed (attempt {attempt+1}), retrying...")
+                    time.sleep(1)
+                else:
+                    raise
 
         time.sleep(0.5)
 
@@ -128,10 +242,25 @@ class ChatGPTSession:
         return response
 
     def _find_send_button(self):
+        """Find the send button, with a brief retry for DOM settling."""
+        # After typing/file upload, the send button may take a moment to enable
+        for wait in range(6):  # up to 3 seconds
+            for sel in S.SEND_BUTTON_SELECTORS:
+                try:
+                    btn = self._page.query_selector(sel)
+                    if btn and btn.is_visible() and btn.is_enabled():
+                        return btn
+                except Exception:
+                    continue
+            time.sleep(0.5)
+        # Last resort: return any visible send button even if not "enabled"
         for sel in S.SEND_BUTTON_SELECTORS:
-            btn = self._page.query_selector(sel)
-            if btn and btn.is_visible():
-                return btn
+            try:
+                btn = self._page.query_selector(sel)
+                if btn and btn.is_visible():
+                    return btn
+            except Exception:
+                continue
         return None
 
     def _wait_for_response(self, timeout=S.RESPONSE_TIMEOUT):

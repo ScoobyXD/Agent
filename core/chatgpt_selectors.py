@@ -44,3 +44,22 @@ NAVIGATION_TIMEOUT = 30      # seconds to wait for page load
 RESPONSE_TIMEOUT = 180       # max wait for response streaming
 TYPING_DELAY_MS = 30         # ms between keystrokes
 POST_SEND_DELAY = 2          # seconds after send before polling
+
+# --- File Upload ---
+# ChatGPT uses a hidden <input type="file"> that we can set directly
+# via Playwright's set_input_files(). These selectors find it.
+FILE_INPUT_SELECTORS = [
+    'input[type="file"]',
+    'input[data-testid="file-upload"]',
+]
+
+# After uploading, ChatGPT shows a preview/chip. Wait for this before sending.
+FILE_UPLOAD_COMPLETE_SELECTORS = [
+    '[data-testid="file-thumbnail"]',
+    '.text-token-text-secondary',           # file name chip
+    'button[aria-label*="Remove"]',          # remove-file button = upload done
+    'img[alt="Uploaded image"]',             # image preview
+]
+
+# How long to wait for upload processing (large files, images)
+FILE_UPLOAD_TIMEOUT = 30     # seconds

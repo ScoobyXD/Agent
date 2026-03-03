@@ -56,10 +56,10 @@ from flask import Flask, send_from_directory, request, jsonify
 from flask_socketio import SocketIO, emit
 
 # ---------------------------------------------------------------------------
-# Determine project root (ui.py lives alongside main.py at project root)
+# Determine project root (ui.py lives in core/, project root is one level up)
 # ---------------------------------------------------------------------------
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent
 PROGRAMS_DIR = ROOT / "programs"
 OUTPUTS_DIR = ROOT / "outputs"
 RAW_MD_DIR = ROOT / "raw_md"
@@ -209,12 +209,13 @@ def api_file(filepath):
 def api_upload():
     """Handle file uploads from the UI.
 
-    Files are saved to uploads/ AND copied to the project root so the
-    pipeline can reference them. For text-based files, we also read the
-    content so the LLM can see it.
+    Files are saved to uploads/ only. Their absolute paths are returned
+    so the pipeline can pass them to ChatGPT's file upload via Playwright.
+    For text-based files, we also read the content as a preview.
     """
     UPLOADS_DIR.mkdir(exist_ok=True)
     uploaded = []
+    file_paths = []  # absolute paths for ChatGPT upload
     file_previews = {}
 
     for key in request.files:
@@ -223,16 +224,12 @@ def api_upload():
             # Sanitize filename for Windows
             safe_name = re.sub(r'[\\/:*?"<>|]+', '_', f.filename)
 
-            # Save to uploads/
+            # Save to uploads/ only
             dest = UPLOADS_DIR / safe_name
             f.save(str(dest))
 
-            # Also copy to project root so scripts can find it
-            root_copy = ROOT / safe_name
-            if not root_copy.exists():
-                shutil.copy2(str(dest), str(root_copy))
-
             uploaded.append(safe_name)
+            file_paths.append(str(dest.resolve()))
 
             # Read text-based files to provide preview to LLM
             text_exts = {".txt", ".csv", ".json", ".py", ".md", ".yaml",
@@ -242,14 +239,17 @@ def api_upload():
             if dest.suffix.lower() in text_exts:
                 try:
                     content = dest.read_text(encoding="utf-8", errors="replace")
-                    # Truncate large files
                     if len(content) > 5000:
                         content = content[:5000] + "\n... (truncated)"
                     file_previews[safe_name] = content
                 except Exception:
                     pass
 
-    return jsonify({"uploaded": uploaded, "previews": file_previews})
+    return jsonify({
+        "uploaded": uploaded,
+        "file_paths": file_paths,
+        "previews": file_previews,
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -279,10 +279,11 @@ def on_run_pipeline(data):
     max_retries = int(data.get("max_retries", 3))
     timeout = int(data.get("timeout", 30))
     headless = data.get("headless", False)
-    attachments = data.get("attachments", [])
+    attachments = data.get("attachments", [])      # display names
+    file_paths = data.get("file_paths", [])         # absolute paths for ChatGPT upload
 
-    # If there are attached files, mention them cleanly in the prompt
-    # (no newlines or brackets that could break filename slugging)
+    # If there are attached files, note them in prompt for logging
+    # (the actual files get uploaded to ChatGPT via browser automation)
     if attachments:
         attachment_note = " (Attached files: " + ", ".join(attachments) + ")"
         prompt += attachment_note
@@ -309,6 +310,7 @@ def on_run_pipeline(data):
                 max_retries=max_retries,
                 timeout=timeout,
                 headed=not headless,
+                attachments=file_paths if file_paths else None,
             )
             socketio.emit("pipeline_complete", {
                 "success": result,
@@ -1090,9 +1092,10 @@ async function sendPrompt() {
     if (!prompt || isRunning) return;
 
     let fileNames = [];
+    let filePaths = [];
     let fileContext = '';
 
-    // Upload any attached files first and get previews
+    // Upload any attached files first and get paths + previews
     if (attachedFiles.length > 0) {
         const formData = new FormData();
         attachedFiles.forEach((f, i) => formData.append('file_' + i, f));
@@ -1100,7 +1103,8 @@ async function sendPrompt() {
             const res = await fetch('/api/upload', { method: 'POST', body: formData });
             const data = await res.json();
             fileNames = data.uploaded || [];
-            // Build file context from previews so LLM can see file contents
+            filePaths = data.file_paths || [];
+            // Build file context from text previews so LLM can see contents
             const previews = data.previews || {};
             for (const [name, content] of Object.entries(previews)) {
                 fileContext += '\\n\\nContents of ' + name + ':\\n```\\n' + content + '\\n```';
@@ -1108,7 +1112,7 @@ async function sendPrompt() {
         } catch(e) { console.error('Upload failed:', e); }
     }
 
-    // Build the full prompt with file context
+    // Build the full prompt with text file context
     let fullPrompt = prompt;
     if (fileContext) {
         fullPrompt += fileContext;
@@ -1121,7 +1125,7 @@ async function sendPrompt() {
     // Add user message (show just the typed prompt, not the file content)
     addUserMessage(prompt);
 
-    // Send to server
+    // Send to server — file_paths go to ChatGPT's file upload via Playwright
     socket.emit('run_pipeline', {
         prompt: fullPrompt,
         target: document.getElementById('targetSelect').value,
@@ -1129,6 +1133,7 @@ async function sendPrompt() {
         timeout: document.getElementById('timeoutInput').value,
         headless: document.getElementById('headlessSelect').value === 'headless',
         attachments: fileNames,
+        file_paths: filePaths,
     });
 
     // Clear input

@@ -18,7 +18,7 @@ from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 
-from core import selectors as S
+from core import chatgpt_selectors as S
 from core.session import ChatGPTSession  # noqa: re-export
 
 PROFILE_DIR = Path(__file__).resolve().parent.parent / ".browser_profile"
