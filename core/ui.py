@@ -15,6 +15,7 @@ Dependencies (auto-installed on first run):
 
 import json
 import os
+import queue
 import re
 import subprocess
 import sys
@@ -127,6 +128,169 @@ _err = AgentWriter(sys.stderr, "stderr")
 _agents = {}
 _agents_lock = threading.Lock()
 _agent_counter = 0
+
+
+class AgentRuntime:
+    """Long-lived ChatGPT session owned by one workbench panel."""
+
+    def __init__(self, agent_id: str, sid: str, headed: bool):
+        self.agent_id = agent_id
+        self.sid = sid
+        self.headed = headed
+        self.thread = threading.Thread(target=self._run, daemon=True, name=agent_id)
+        self.inbox = queue.Queue()
+        self.stop_event = threading.Event()
+
+    def start(self):
+        self.thread.start()
+
+    def send(self, prompt: str, file_paths: list):
+        self.inbox.put({"type": "prompt", "prompt": prompt, "file_paths": file_paths or []})
+
+    def close(self):
+        self.stop_event.set()
+        self.inbox.put({"type": "close"})
+
+    def is_alive(self):
+        return self.thread.is_alive()
+
+    def _run(self):
+        from core.session import ChatGPTSession
+        import base64 as _b64
+
+        last_frame_at = 0.0
+
+        def emit_output(text: str, stream: str = "stdout"):
+            socketio.emit("agent_output", {
+                "agent_id": self.agent_id,
+                "stream": stream,
+                "text": text,
+            }, to=self.sid)
+
+        def take_frame(sess):
+            nonlocal last_frame_at
+            try:
+                now = time.time()
+                if now - last_frame_at < 0.25:
+                    return
+                if sess._page and not sess._page.is_closed():
+                    img = sess._page.screenshot(type="jpeg", quality=55, timeout=1500)
+                    if img:
+                        socketio.emit("agent_screenshot", {
+                            "agent_id": self.agent_id,
+                            "image": _b64.b64encode(img).decode("ascii"),
+                            "mime": "image/jpeg",
+                        }, to=self.sid)
+                        last_frame_at = now
+            except Exception:
+                pass
+
+        try:
+            profile_dir = ROOT / f".browser_profile_ui_{self.agent_id}"
+            with ChatGPTSession(headed=self.headed, profile_dir=profile_dir) as session:
+                _orig_wait = ChatGPTSession._wait_for_response
+                _orig_nav = ChatGPTSession._navigate_to_new_chat
+
+                def _patched_wait(self_sess, timeout_val=None):
+                    from core import chatgpt_selectors as _S
+
+                    _timeout = timeout_val if timeout_val is not None else _S.RESPONSE_TIMEOUT
+                    emit_output("[...] Waiting for response...\n")
+                    deadline = time.time() + _timeout
+                    last_text_len = 0
+                    stable_ticks = 0
+                    tick_s = 0.35
+
+                    while time.time() < deadline:
+                        still_streaming = False
+                        for sel in _S.STOP_GENERATING_SELECTORS:
+                            stop_btn = self_sess._page.query_selector(sel)
+                            if stop_btn and stop_btn.is_visible():
+                                still_streaming = True
+                                break
+
+                        if not still_streaming:
+                            for sel in _S.RESPONSE_COMPLETE_INDICATORS:
+                                indicator = self_sess._page.query_selector(sel)
+                                if indicator and indicator.is_visible():
+                                    take_frame(self_sess)
+                                    emit_output("[OK] Response complete.\n")
+                                    return True
+
+                            current_len = 0
+                            for sel in _S.ASSISTANT_MESSAGE_SELECTORS:
+                                msgs = self_sess._page.query_selector_all(sel)
+                                if msgs:
+                                    try:
+                                        current_len = len(msgs[-1].inner_text())
+                                    except Exception:
+                                        pass
+                                    break
+
+                            if current_len > 0 and current_len == last_text_len:
+                                stable_ticks += 1
+                            else:
+                                stable_ticks = 0
+                            last_text_len = current_len
+
+                            if stable_ticks >= 6 and current_len > 50:
+                                take_frame(self_sess)
+                                emit_output("[OK] Response appears complete (content stable).\n")
+                                return True
+
+                        take_frame(self_sess)
+                        time.sleep(tick_s)
+
+                    take_frame(self_sess)
+                    emit_output("[WARN] Response timeout -- may be incomplete.\n", "stderr")
+                    return False
+
+                def _patched_nav(self_sess):
+                    _orig_nav(self_sess)
+                    take_frame(self_sess)
+
+                ChatGPTSession._wait_for_response = _patched_wait
+                ChatGPTSession._navigate_to_new_chat = _patched_nav
+
+                try:
+                    socketio.emit("agent_ready", {"agent_id": self.agent_id}, to=self.sid)
+                    first_prompt = True
+                    while not self.stop_event.is_set():
+                        try:
+                            msg = self.inbox.get(timeout=0.2)
+                        except queue.Empty:
+                            continue
+
+                        if msg.get("type") == "close":
+                            break
+
+                        prompt = msg.get("prompt", "").strip()
+                        file_paths = msg.get("file_paths") or []
+                        if not prompt:
+                            continue
+
+                        socketio.emit("agent_busy", {"agent_id": self.agent_id}, to=self.sid)
+                        emit_output(f"\n[USER] {prompt}\n")
+                        try:
+                            if first_prompt:
+                                response = session.prompt(prompt, files=file_paths)
+                                first_prompt = False
+                            else:
+                                response = session.followup(prompt, files=file_paths)
+                            emit_output("\n[ASSISTANT]\n")
+                            emit_output(response + "\n")
+                            socketio.emit("agent_done", {"agent_id": self.agent_id, "success": True}, to=self.sid)
+                        except Exception as e:
+                            socketio.emit("agent_error", {"agent_id": self.agent_id, "error": str(e)}, to=self.sid)
+                finally:
+                    ChatGPTSession._wait_for_response = _orig_wait
+                    ChatGPTSession._navigate_to_new_chat = _orig_nav
+        except Exception as e:
+            socketio.emit("agent_error", {"agent_id": self.agent_id, "error": str(e)}, to=self.sid)
+        finally:
+            socketio.emit("agent_closed", {"agent_id": self.agent_id}, to=self.sid)
+            with _agents_lock:
+                _agents.pop(self.agent_id, None)
 
 # ---------------------------------------------------------------------------
 # API routes
@@ -248,9 +412,6 @@ def on_run_agent(data):
         _agent_counter += 1
         agent_id = f"agent-{_agent_counter}"
 
-    target = data.get("target")
-    max_retries = int(data.get("max_retries", 3))
-    timeout = int(data.get("timeout", 30))
     headless = data.get("headless", False)
     file_paths = data.get("file_paths", [])
     attachments = data.get("attachments", [])
@@ -260,135 +421,41 @@ def on_run_agent(data):
 
     sid = request.sid
 
-    def run():
-        _out.agent_id = agent_id
-        _out.sid = sid
-        _err.agent_id = agent_id
-        _err.sid = sid
-
-        old_out, old_err = sys.stdout, sys.stderr
-        sys.stdout = _out
-        sys.stderr = _err
-
-        try:
-            from main import run_pipeline
-            from core.session import ChatGPTSession
-            import base64 as _b64
-
-            # Hook into the session to push screenshots from the correct thread.
-            # We patch _wait_for_response to take screenshots during its polling
-            # loop (it already runs time.sleep(1) in a loop, perfect for this).
-            _orig_wait = ChatGPTSession._wait_for_response
-
-            def _patched_wait(self_sess, timeout_val=None):
-                """Wrapper that takes screenshots during the wait loop."""
-                import time as _time
-                from core import chatgpt_selectors as _S
-                _timeout = timeout_val if timeout_val is not None else _S.RESPONSE_TIMEOUT
-                print("[...] Waiting for response...")
-                deadline = _time.time() + _timeout
-                last_text_len = 0
-                stable_count = 0
-                _ss_counter = 0
-
-                while _time.time() < deadline:
-                    still_streaming = False
-                    for sel in _S.STOP_GENERATING_SELECTORS:
-                        stop_btn = self_sess._page.query_selector(sel)
-                        if stop_btn and stop_btn.is_visible():
-                            still_streaming = True
-                            break
-
-                    if not still_streaming:
-                        for sel in _S.RESPONSE_COMPLETE_INDICATORS:
-                            indicator = self_sess._page.query_selector(sel)
-                            if indicator and indicator.is_visible():
-                                _take_screenshot(self_sess)
-                                print("[OK] Response complete.")
-                                return True
-
-                        current_len = 0
-                        for sel in _S.ASSISTANT_MESSAGE_SELECTORS:
-                            msgs = self_sess._page.query_selector_all(sel)
-                            if msgs:
-                                try:
-                                    current_len = len(msgs[-1].inner_text())
-                                except Exception:
-                                    pass
-                                break
-
-                        if current_len > 0 and current_len == last_text_len:
-                            stable_count += 1
-                        else:
-                            stable_count = 0
-                        last_text_len = current_len
-
-                        if stable_count >= 5 and current_len > 50:
-                            _take_screenshot(self_sess)
-                            print("[OK] Response appears complete (content stable).")
-                            return True
-
-                    # Take screenshot every ~3 seconds during streaming
-                    _ss_counter += 1
-                    if _ss_counter % 3 == 0:
-                        _take_screenshot(self_sess)
-
-                    _time.sleep(1)
-
-                _take_screenshot(self_sess)
-                print("[WARN] Response timeout -- may be incomplete.")
-                return False
-
-            def _take_screenshot(sess):
-                """Take a screenshot and push it via WebSocket (same thread = safe)."""
-                try:
-                    if sess._page and not sess._page.is_closed():
-                        png = sess._page.screenshot(type="png", timeout=3000)
-                        if png:
-                            socketio.emit("agent_screenshot", {
-                                "agent_id": agent_id,
-                                "image": _b64.b64encode(png).decode("ascii"),
-                            }, to=sid)
-                except Exception:
-                    pass
-
-            # Also take screenshot after navigate
-            _orig_nav = ChatGPTSession._navigate_to_new_chat
-            def _patched_nav(self_sess):
-                _orig_nav(self_sess)
-                _take_screenshot(self_sess)
-            
-            ChatGPTSession._wait_for_response = _patched_wait
-            ChatGPTSession._navigate_to_new_chat = _patched_nav
-            try:
-                result = run_pipeline(
-                    prompt=prompt,
-                    target=target if target != "auto" else None,
-                    max_retries=max_retries,
-                    timeout=timeout,
-                    headed=not headless,
-                    attachments=file_paths if file_paths else None,
-                )
-            finally:
-                ChatGPTSession._wait_for_response = _orig_wait
-                ChatGPTSession._navigate_to_new_chat = _orig_nav
-
-            socketio.emit("agent_done", {"agent_id": agent_id, "success": result}, to=sid)
-        except Exception as e:
-            socketio.emit("agent_error", {"agent_id": agent_id, "error": str(e)}, to=sid)
-        finally:
-            sys.stdout = old_out
-            sys.stderr = old_err
-            _out.agent_id = None
-            _err.agent_id = None
-            with _agents_lock:
-                _agents.pop(agent_id, None)
-
     emit("agent_created", {"agent_id": agent_id, "prompt": prompt})
-    t = threading.Thread(target=run, daemon=True, name=agent_id)
+    runtime = AgentRuntime(agent_id=agent_id, sid=sid, headed=not headless)
     with _agents_lock:
-        _agents[agent_id] = t
-    t.start()
+        _agents[agent_id] = runtime
+    runtime.start()
+    runtime.send(prompt=prompt, file_paths=file_paths if file_paths else [])
+
+
+@socketio.on("agent_send")
+def on_agent_send(data):
+    agent_id = data.get("agent_id")
+    prompt = (data.get("prompt") or "").strip()
+    if not agent_id or not prompt:
+        emit("agent_error", {"agent_id": agent_id, "error": "Missing agent_id or prompt."})
+        return
+
+    file_paths = data.get("file_paths") or []
+    with _agents_lock:
+        runtime = _agents.get(agent_id)
+    if not runtime or not runtime.is_alive():
+        emit("agent_error", {"agent_id": agent_id, "error": "Session is not active."})
+        return
+
+    runtime.send(prompt=prompt, file_paths=file_paths)
+
+
+@socketio.on("agent_close")
+def on_agent_close(data):
+    agent_id = data.get("agent_id")
+    if not agent_id:
+        return
+    with _agents_lock:
+        runtime = _agents.get(agent_id)
+    if runtime and hasattr(runtime, "close"):
+        runtime.close()
 
 @socketio.on("run_tests")
 def on_run_tests(data):
@@ -569,8 +636,10 @@ html,body{height:100%;overflow:hidden;font-family:'DM Sans',sans-serif;backgroun
   overflow:hidden;display:flex;flex-direction:column;
   min-width:420px;min-height:280px;
   width:calc(50% - 6px);height:420px;
-  resize:both;
+  position:relative;
 }
+.agent-panel.minimized{height:34px!important;min-height:34px!important}
+.agent-panel.minimized .agent-body,.agent-panel.minimized .agent-status{display:none}
 .agent-panel.maximized{
   position:fixed!important;inset:var(--toolbar-h) 0 72px 0!important;
   width:auto!important;height:auto!important;z-index:50;border-radius:0;
@@ -593,7 +662,7 @@ html,body{height:100%;overflow:hidden;font-family:'DM Sans',sans-serif;backgroun
 }
 .agent-head .head-btn:hover{background:var(--bg);color:var(--tx)}
 
-.agent-body{flex:1;display:flex;overflow:hidden}
+.agent-body{flex:1;display:flex;overflow:hidden;min-height:0}
 
 .agent-terminal{
   flex:1;overflow-y:auto;padding:10px 12px;
@@ -614,10 +683,11 @@ html,body{height:100%;overflow:hidden;font-family:'DM Sans',sans-serif;backgroun
 .agent-terminal .line-num{color:var(--tx3);user-select:none;display:inline-block;min-width:32px;text-align:right;margin-right:8px}
 
 .agent-browser{
-  flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;
+  flex:1;display:flex;flex-direction:column;
   background:#0a0a10;color:var(--tx3);font-size:12px;text-align:center;
   overflow:hidden;min-width:0;position:relative;
 }
+.agent-browser-main{flex:1;min-height:0;display:flex;align-items:center;justify-content:center;position:relative;border-bottom:1px solid var(--brd)}
 .agent-browser img{
   width:100%;height:100%;object-fit:contain;display:block;
 }
@@ -625,6 +695,21 @@ html,body{height:100%;overflow:hidden;font-family:'DM Sans',sans-serif;backgroun
   display:flex;flex-direction:column;align-items:center;gap:8px;padding:20px;
 }
 .agent-browser .placeholder svg{opacity:.3}
+.agent-extra-context{height:50%;min-height:72px;padding:8px 10px;overflow:auto;color:var(--tx3);font-size:11px;text-align:left}
+
+.panel-input{border-top:1px solid var(--brd);padding:6px;display:flex;flex-direction:column;gap:6px;background:var(--bg2)}
+.panel-attach-tags{display:flex;gap:4px;flex-wrap:wrap}
+.panel-input-row{display:flex;align-items:flex-end;gap:6px;background:var(--bg3);border:1px solid var(--brd);border-radius:10px;padding:2px}
+.panel-text{flex:1;background:none;border:none;outline:none;color:var(--tx);font-family:inherit;font-size:12px;line-height:1.4;padding:6px 4px;resize:none;min-height:20px;max-height:120px}
+
+.resize-handle{position:absolute;z-index:12}
+.resize-n,.resize-s{left:8px;right:8px;height:6px}
+.resize-n{top:-3px;cursor:n-resize}.resize-s{bottom:-3px;cursor:s-resize}
+.resize-e,.resize-w{top:8px;bottom:8px;width:6px}
+.resize-e{right:-3px;cursor:e-resize}.resize-w{left:-3px;cursor:w-resize}
+.resize-ne,.resize-nw,.resize-se,.resize-sw{width:10px;height:10px}
+.resize-ne{top:-4px;right:-4px;cursor:ne-resize}.resize-nw{top:-4px;left:-4px;cursor:nw-resize}
+.resize-se{bottom:-4px;right:-4px;cursor:se-resize}.resize-sw{bottom:-4px;left:-4px;cursor:sw-resize}
 
 .agent-status{
   height:26px;border-top:1px solid var(--brd);display:flex;align-items:center;
@@ -855,10 +940,39 @@ function stripAnsi(s) {
 socket.on('agent_done', d => {
   const a = agents[d.agent_id];
   if (!a) return;
-  const ok = d.success;
-  a.dot.className = 'dot ' + (ok ? 'pass' : 'fail');
-  a.status.className = 'agent-status ' + (ok ? 'pass' : 'fail');
-  a.status.textContent = ok ? 'PASS \u2014 completed' : 'FAIL \u2014 see output';
+  a.dot.className = 'dot pass';
+  a.status.className = 'agent-status pass';
+  a.status.textContent = 'Ready — session alive';
+  if (a.sendBtn) a.sendBtn.disabled = false;
+  updateGlobalStatus();
+});
+
+socket.on('agent_busy', d => {
+  const a = agents[d.agent_id];
+  if (!a) return;
+  a.dot.className = 'dot run';
+  a.status.className = 'agent-status running';
+  a.status.textContent = 'Running...';
+  if (a.sendBtn) a.sendBtn.disabled = true;
+  updateGlobalStatus();
+});
+
+socket.on('agent_ready', d => {
+  const a = agents[d.agent_id];
+  if (!a) return;
+  a.dot.className = 'dot pass';
+  a.status.className = 'agent-status pass';
+  a.status.textContent = 'Ready — session alive';
+  updateGlobalStatus();
+});
+
+socket.on('agent_closed', d => {
+  const a = agents[d.agent_id];
+  if (!a) return;
+  a.dot.className = 'dot fail';
+  a.status.className = 'agent-status fail';
+  a.status.textContent = 'Session closed';
+  if (a.sendBtn) a.sendBtn.disabled = true;
   updateGlobalStatus();
 });
 
@@ -871,7 +985,8 @@ socket.on('agent_error', d => {
   a.terminal.appendChild(span);
   a.dot.className = 'dot fail';
   a.status.className = 'agent-status fail';
-  a.status.textContent = 'ERROR \u2014 ' + (d.error || '').slice(0, 60);
+  a.status.textContent = 'ERROR — ' + (d.error || '').slice(0, 60);
+  if (a.sendBtn) a.sendBtn.disabled = false;
   updateGlobalStatus();
 });
 
@@ -886,6 +1001,14 @@ function createPanel(id, prompt, isTest) {
   const shortPrompt = esc((isTest ? 'Test Suite' : prompt).slice(0, 80));
 
   panel.innerHTML =
+    '<div class="resize-handle resize-n" data-dir="n"></div>' +
+    '<div class="resize-handle resize-s" data-dir="s"></div>' +
+    '<div class="resize-handle resize-e" data-dir="e"></div>' +
+    '<div class="resize-handle resize-w" data-dir="w"></div>' +
+    '<div class="resize-handle resize-ne" data-dir="ne"></div>' +
+    '<div class="resize-handle resize-nw" data-dir="nw"></div>' +
+    '<div class="resize-handle resize-se" data-dir="se"></div>' +
+    '<div class="resize-handle resize-sw" data-dir="sw"></div>' +
     '<div class="agent-head">' +
       '<div class="dot run"></div>' +
       '<span class="label" title="' + safePrompt + '">' + shortPrompt + '</span>' +
@@ -895,19 +1018,112 @@ function createPanel(id, prompt, isTest) {
     '<div class="agent-body">' +
       '<div class="agent-terminal"></div>' +
       '<div class="agent-browser">' +
-        '<div class="placeholder">' +
-          '<svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>' +
-          '<span>Waiting for browser...</span>' +
+        '<div class="agent-browser-main">' +
+          '<div class="placeholder">' +
+            '<svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>' +
+            '<span>Waiting for browser...</span>' +
+          '</div>' +
+          '<img style="display:none" />' +
         '</div>' +
-        '<img style="display:none" />' +
+        '<div class="agent-extra-context">Reserved for extra context panel.</div>' +
       '</div>' +
     '</div>' +
-    '<div class="agent-status running">Running...</div>';
+    '<div class="panel-input">' +
+      '<div class="panel-attach-tags"></div>' +
+      '<div class="panel-input-row">' +
+        '<button class="attach-btn" title="Attach files"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/></svg></button>' +
+        '<textarea class="panel-text" rows="1" placeholder="Continue this session..."></textarea>' +
+        '<button class="send-btn" title="Send"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg></button>' +
+      '</div>' +
+      '<input type="file" class="panel-file" multiple style="display:none">' +
+    '</div>' +
+    '<div class="agent-status running">Starting session...</div>';
 
   wb.appendChild(panel);
 
   const head = panel.querySelector('.agent-head');
   makeDraggable(panel, head);
+  makeResizable(panel);
+
+  const textarea = panel.querySelector('.panel-text');
+  const fileInput = panel.querySelector('.panel-file');
+  const attachBtn = panel.querySelector('.attach-btn');
+  const sendBtn = panel.querySelector('.send-btn');
+  const tagsEl = panel.querySelector('.panel-attach-tags');
+  const localFiles = [];
+
+  attachBtn.addEventListener('click', () => fileInput.click());
+  fileInput.addEventListener('change', () => {
+    for (const f of fileInput.files) localFiles.push(f);
+    fileInput.value = '';
+    renderTags();
+  });
+
+  function renderTags() {
+    tagsEl.innerHTML = localFiles.map((f, i) =>
+      '<div class="attach-tag">' + esc(f.name) + '<span class="rm" data-i="' + i + '">&times;</span></div>'
+    ).join('');
+    tagsEl.querySelectorAll('.rm').forEach(el => {
+      el.addEventListener('click', () => {
+        const i = Number(el.getAttribute('data-i'));
+        localFiles.splice(i, 1);
+        renderTags();
+      });
+    });
+  }
+
+  async function sendInPanel() {
+    const prompt = textarea.value.trim();
+    if (!prompt || sendBtn.disabled) return;
+    let fileCtx = '';
+    let filePaths = [];
+    if (localFiles.length) {
+      const fd = new FormData();
+      localFiles.forEach((f, i) => fd.append('file_' + i, f));
+      try {
+        const res = await fetch('/api/upload', { method: 'POST', body: fd });
+        const d = await res.json();
+        filePaths = d.file_paths || [];
+        for (const [n, c] of Object.entries(d.previews || {})) {
+          fileCtx += '\n\nContents of ' + n + ':\n```\n' + c + '\n```';
+        }
+      } catch (e) { console.error(e); }
+    }
+    socket.emit('agent_send', { agent_id: id, prompt: prompt + fileCtx, file_paths: filePaths });
+    textarea.value = '';
+    textarea.style.height = 'auto';
+    localFiles.length = 0;
+    renderTags();
+  }
+
+  sendBtn.addEventListener('click', sendInPanel);
+  textarea.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendInPanel(); }
+  });
+  textarea.addEventListener('input', () => autoResize(textarea));
+  textarea.addEventListener('paste', e => {
+    for (const item of (e.clipboardData?.items || [])) {
+      if (item.type && item.type.startsWith('image/')) {
+        const f = item.getAsFile();
+        if (f) localFiles.push(f);
+      }
+    }
+    renderTags();
+  });
+
+  panel.addEventListener('dragover', e => e.preventDefault());
+  panel.addEventListener('drop', e => {
+    e.preventDefault();
+    if (!e.dataTransfer?.files?.length) return;
+    for (const f of e.dataTransfer.files) localFiles.push(f);
+    renderTags();
+  });
+
+  head.addEventListener('click', e => {
+    if (e.target.closest('.head-btn')) return;
+    if (Math.abs((head._dragDx || 0)) > 3 || Math.abs((head._dragDy || 0)) > 3) return;
+    panel.classList.toggle('minimized');
+  });
 
   agents[id] = {
     el: panel,
@@ -916,16 +1132,18 @@ function createPanel(id, prompt, isTest) {
     status: panel.querySelector('.agent-status'),
     browserImg: panel.querySelector('.agent-browser img'),
     browserPlaceholder: panel.querySelector('.agent-browser .placeholder'),
+    sendBtn,
   };
 
   updateGlobalStatus();
 }
 
-// Live screenshots pushed from the pipeline thread (same-thread = no greenlet issues)
+// Live screenshots pushed from the pipeline thread
 socket.on('agent_screenshot', d => {
   const a = agents[d.agent_id];
   if (!a || !d.image) return;
-  a.browserImg.src = 'data:image/png;base64,' + d.image;
+  const mime = d.mime || 'image/png';
+  a.browserImg.src = 'data:' + mime + ';base64,' + d.image;
   a.browserImg.style.display = 'block';
   a.browserPlaceholder.style.display = 'none';
 });
@@ -936,6 +1154,7 @@ function toggleMax(id) {
 }
 
 function closePanel(id) {
+  socket.emit('agent_close', { agent_id: id });
   const a = agents[id];
   if (a) a.el.remove();
   delete agents[id];
@@ -958,6 +1177,7 @@ function makeDraggable(panel, handle) {
     if (e.target.closest('.head-btn')) return;
     if (panel.classList.contains('maximized')) return;
     dragging = true;
+    handle._dragDx = 0; handle._dragDy = 0;
     const r = panel.getBoundingClientRect();
     const wr = panel.parentElement.getBoundingClientRect();
     ox = r.left - wr.left + panel.parentElement.scrollLeft;
@@ -971,12 +1191,62 @@ function makeDraggable(panel, handle) {
   });
   document.addEventListener('mousemove', e => {
     if (!dragging) return;
-    panel.style.left = (ox + e.clientX - sx) + 'px';
-    panel.style.top = (oy + e.clientY - sy) + 'px';
+    handle._dragDx = e.clientX - sx;
+    handle._dragDy = e.clientY - sy;
+    panel.style.left = (ox + handle._dragDx) + 'px';
+    panel.style.top = (oy + handle._dragDy) + 'px';
   });
   document.addEventListener('mouseup', () => {
     if (!dragging) return;
     dragging = false;
+    panel.style.zIndex = '';
+    setTimeout(() => { handle._dragDx = 0; handle._dragDy = 0; }, 0);
+  });
+}
+
+function makeResizable(panel) {
+  let resizing = null;
+  panel.querySelectorAll('.resize-handle').forEach(h => {
+    h.addEventListener('mousedown', e => {
+      if (panel.classList.contains('maximized') || panel.classList.contains('minimized')) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const dir = h.getAttribute('data-dir');
+      const rect = panel.getBoundingClientRect();
+      resizing = {
+        dir,
+        sx: e.clientX,
+        sy: e.clientY,
+        left: rect.left + panel.parentElement.scrollLeft,
+        top: rect.top + panel.parentElement.scrollTop,
+        w: rect.width,
+        h: rect.height,
+      };
+      panel.style.position = 'absolute';
+      panel.style.zIndex = 11;
+    });
+  });
+
+  document.addEventListener('mousemove', e => {
+    if (!resizing) return;
+    const dx = e.clientX - resizing.sx;
+    const dy = e.clientY - resizing.sy;
+    let {left, top, w, h, dir} = resizing;
+
+    if (dir.includes('e')) w = Math.max(420, resizing.w + dx);
+    if (dir.includes('s')) h = Math.max(280, resizing.h + dy);
+    if (dir.includes('w')) { w = Math.max(420, resizing.w - dx); left = resizing.left + (resizing.w - w); }
+    if (dir.includes('n')) { h = Math.max(280, resizing.h - dy); top = resizing.top + (resizing.h - h); }
+
+    panel.style.width = w + 'px';
+    panel.style.height = h + 'px';
+    panel.style.left = left + 'px';
+    panel.style.top = top + 'px';
+  });
+
+  document.addEventListener('mouseup', () => {
+    if (!resizing) return;
+    resizing = null;
     panel.style.zIndex = '';
   });
 }
@@ -1004,8 +1274,6 @@ async function sendPrompt() {
   socket.emit('run_agent', {
     prompt: prompt + fileCtx,
     target: document.getElementById('targetSel').value,
-    max_retries: document.getElementById('retriesIn').value,
-    timeout: document.getElementById('timeoutIn').value,
     headless: document.getElementById('headlessSel').value === 'headless',
     attachments: fileNames,
     file_paths: filePaths,
