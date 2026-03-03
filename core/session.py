@@ -66,6 +66,24 @@ class ChatGPTSession:
         if self._pw:
             self._pw.stop()
 
+    @property
+    def page(self):
+        """Expose page for external use (e.g. screenshots)."""
+        return self._page
+
+    def screenshot(self) -> bytes:
+        """Take a PNG screenshot of the current ChatGPT page.
+
+        Returns raw PNG bytes, or empty bytes if unavailable.
+        Used by the UI to show a live preview of the browser session.
+        """
+        try:
+            if self._page and not self._page.is_closed():
+                return self._page.screenshot(type="png", timeout=5000)
+        except Exception:
+            pass
+        return b""
+
     # --- Public API ---
 
     def prompt(self, text: str, files: list = None) -> str:

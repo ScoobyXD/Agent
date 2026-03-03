@@ -179,14 +179,14 @@ def build_initial_prompt(user_prompt: str, context: str, target: str,
     else:
         exec_env = (
             "- My runner saves your code to a .py file and executes it with Python.\n"
-            "- Try to write Python, even for simple tasks (folders, file ops, git, shell commands).\n"
+            "- ALWAYS write Python, even for simple tasks (folders, file ops, git, shell commands).\n"
             "- Use subprocess.run() for system/shell commands. Use os, shutil, pathlib for file ops.\n"
             "- NEVER write bash/shell scripts -- only Python works here."
         )
 
     return (
         f"=== ROLE ===\n"
-        f"You are a helpful agent that helps me write code, solve problems, and cobble together things when I try something new.\n"
+        f"You are helping me debug and write code for hardware.\n"
         f"Code will be deployed and executed on: {target_desc}.\n"
         f"\n"
         f"=== SYSTEM CONTEXT ===\n"
@@ -196,12 +196,11 @@ def build_initial_prompt(user_prompt: str, context: str, target: str,
         f"{exec_env}\n"
         f"\n"
         f"=== RESPONSE FORMAT ===\n"
-        f"- If you are writing code, put ALL code inside exactly ONE fenced code block (```language\\n...code...\\n```).\n"
+        f"- Put ALL code inside exactly ONE fenced code block (```language\\n...code...\\n```).\n"
         f"- Do NOT put any text after the closing ```. No usage instructions, no \"how to run\", no \"save as\".\n"
         f"- If you need multiple files or steps, combine them into ONE script.\n"
         f"- If you need a package installed, include INSTALL: package1, package2 BEFORE the code block.\n"
         f"- If this will take longer than 30s to run, include TIMEOUT: <seconds> BEFORE the code block.\n"
-        f"- If you are not writing code, lets have a conversation"
         f"\n"
         f"=== RULES ===\n"
         f"- SIMPLICITY FIRST: prefer the simplest, most direct solution. Fewer lines = fewer bugs.\n"
