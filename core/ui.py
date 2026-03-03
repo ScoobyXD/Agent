@@ -454,7 +454,7 @@ def on_agent_close(data):
         return
     with _agents_lock:
         runtime = _agents.get(agent_id)
-    if runtime:
+    if runtime and hasattr(runtime, "close"):
         runtime.close()
 
 @socketio.on("run_tests")
@@ -1101,6 +1101,23 @@ function createPanel(id, prompt, isTest) {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendInPanel(); }
   });
   textarea.addEventListener('input', () => autoResize(textarea));
+  textarea.addEventListener('paste', e => {
+    for (const item of (e.clipboardData?.items || [])) {
+      if (item.type && item.type.startsWith('image/')) {
+        const f = item.getAsFile();
+        if (f) localFiles.push(f);
+      }
+    }
+    renderTags();
+  });
+
+  panel.addEventListener('dragover', e => e.preventDefault());
+  panel.addEventListener('drop', e => {
+    e.preventDefault();
+    if (!e.dataTransfer?.files?.length) return;
+    for (const f of e.dataTransfer.files) localFiles.push(f);
+    renderTags();
+  });
 
   head.addEventListener('click', e => {
     if (e.target.closest('.head-btn')) return;
