@@ -15,6 +15,7 @@ Dependencies (auto-installed on first run):
 
 import json
 import os
+import queue
 import re
 import subprocess
 import sys
@@ -264,7 +265,17 @@ def on_run_agent(data):
 
     sid = request.sid
 
+    # Create a work queue for this agent. The thread that owns the Playwright
+    # session will consume tasks from it (follow-ups, close).
+    agent_queue = queue.Queue()
+
     def run():
+        """Agent thread: runs the pipeline, then waits for follow-up tasks.
+
+        This thread owns the Playwright session for its entire lifetime.
+        Follow-ups and close commands are sent via agent_queue so they
+        execute on THIS thread, avoiding Playwright's thread-affinity error.
+        """
         _out.agent_id = agent_id
         _out.sid = sid
         _err.agent_id = agent_id
@@ -275,35 +286,27 @@ def on_run_agent(data):
         sys.stderr = _err
 
         session = None
+        md_path = None
         try:
             from main import run_pipeline
             from core.session import ChatGPTSession
+            from skills.chatgpt_skill import append_to_log
             import base64 as _b64
 
-            # --- Create session externally so we own its lifecycle ---
+            # --- Create session on THIS thread so Playwright is happy ---
             session = ChatGPTSession(headed=not headless)
             session.__enter__()
 
-            # Store it so follow-ups can use it later
-            with _agent_sessions_lock:
-                _agent_sessions[agent_id] = {"session": session, "sid": sid}
-
-            # --- Auto-scroll helper: scroll ChatGPT page to bottom ---
+            # --- Auto-scroll + screenshot helpers (closures over agent_id/sid) ---
             def _scroll_to_bottom(sess):
-                """Scroll the ChatGPT page to the bottom so streaming content is visible."""
                 try:
                     if sess._page and not sess._page.is_closed():
                         sess._page.evaluate("""
                             () => {
-                                // ChatGPT's main scrollable container
                                 const containers = document.querySelectorAll('[class*="react-scroll-to-bottom"]');
-                                for (const c of containers) {
-                                    c.scrollTop = c.scrollHeight;
-                                }
-                                // Fallback: scroll the main element
+                                for (const c of containers) c.scrollTop = c.scrollHeight;
                                 const main = document.querySelector('main');
                                 if (main) main.scrollTop = main.scrollHeight;
-                                // Also try the conversation turn container
                                 const conv = document.querySelector('[class*="conversation-turn"]:last-child');
                                 if (conv) conv.scrollIntoView({ block: 'end' });
                             }
@@ -312,7 +315,6 @@ def on_run_agent(data):
                     pass
 
             def _take_screenshot(sess):
-                """Scroll to bottom, then take a screenshot and push via WebSocket."""
                 try:
                     if sess._page and not sess._page.is_closed():
                         _scroll_to_bottom(sess)
@@ -325,11 +327,10 @@ def on_run_agent(data):
                 except Exception:
                     pass
 
-            # Hook into the session to push screenshots during response wait.
+            # --- Monkey-patch _wait_for_response for live screenshots ---
             _orig_wait = ChatGPTSession._wait_for_response
 
             def _patched_wait(self_sess, timeout_val=None):
-                """Wrapper that takes screenshots during the wait loop."""
                 import time as _time
                 from core import chatgpt_selectors as _S
                 _timeout = timeout_val if timeout_val is not None else _S.RESPONSE_TIMEOUT
@@ -375,23 +376,22 @@ def on_run_agent(data):
                             print("[OK] Response appears complete (content stable).")
                             return True
 
-                    # Take screenshot every ~1 second during streaming
                     _take_screenshot(self_sess)
-
                     _time.sleep(1)
 
                 _take_screenshot(self_sess)
                 print("[WARN] Response timeout -- may be incomplete.")
                 return False
 
-            # Also take screenshot after navigate
             _orig_nav = ChatGPTSession._navigate_to_new_chat
             def _patched_nav(self_sess):
                 _orig_nav(self_sess)
                 _take_screenshot(self_sess)
-            
+
             ChatGPTSession._wait_for_response = _patched_wait
             ChatGPTSession._navigate_to_new_chat = _patched_nav
+
+            # ---- Phase 1: Run the pipeline ----
             try:
                 result = run_pipeline(
                     prompt=prompt,
@@ -402,24 +402,99 @@ def on_run_agent(data):
                     attachments=file_paths if file_paths else None,
                     session=session,
                 )
-            finally:
-                ChatGPTSession._wait_for_response = _orig_wait
-                ChatGPTSession._navigate_to_new_chat = _orig_nav
+            except Exception as e:
+                socketio.emit("agent_error", {"agent_id": agent_id, "error": str(e)}, to=sid)
+                result = False
 
-            # Pipeline done, but do NOT close the session -- keep it alive
-            # for follow-ups. It will be closed when the panel is closed.
+            # Recover the raw_md path from the pipeline's log directory
+            try:
+                _raw_md_dir = Path(__file__).resolve().parent.parent / "raw_md"
+                if _raw_md_dir.exists():
+                    md_files = sorted(_raw_md_dir.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
+                    if md_files:
+                        md_path = md_files[0]  # most recent log
+            except Exception:
+                pass
+
+            # Store session info (with queue and md_path) for follow-ups
+            with _agent_sessions_lock:
+                _agent_sessions[agent_id] = {
+                    "session": session,
+                    "sid": sid,
+                    "queue": agent_queue,
+                    "md_path": md_path,
+                }
+
             socketio.emit("agent_done", {"agent_id": agent_id, "success": result}, to=sid)
+
+            # ---- Phase 2: Wait for follow-up tasks on the queue ----
+            # This keeps the thread (and Playwright session) alive.
+            while True:
+                try:
+                    task = agent_queue.get(timeout=1)
+                except queue.Empty:
+                    # Check if we've been removed from sessions (panel closed)
+                    with _agent_sessions_lock:
+                        if agent_id not in _agent_sessions:
+                            break
+                    continue
+
+                if task is None:
+                    # Poison pill: close signal
+                    break
+
+                task_type = task.get("type")
+
+                if task_type == "followup":
+                    fu_prompt = task["prompt"]
+                    fu_files = task.get("file_paths", [])
+
+                    # Re-activate output routing
+                    _out.agent_id = agent_id
+                    _out.sid = sid
+                    _err.agent_id = agent_id
+                    _err.sid = sid
+                    sys.stdout = _out
+                    sys.stderr = _err
+
+                    socketio.emit("agent_running", {"agent_id": agent_id}, to=sid)
+
+                    try:
+                        print(f"\n[FOLLOWUP] Sending to ChatGPT ({len(fu_prompt)} chars)...")
+                        response = session.followup(fu_prompt, files=fu_files if fu_files else None)
+                        _take_screenshot(session)
+                        print(f"[OK] Follow-up response received ({len(response)} chars)")
+
+                        # Append to raw_md log for continuity
+                        if md_path:
+                            append_to_log(md_path, "Follow-up Prompt", fu_prompt)
+                            append_to_log(md_path, "Follow-up Response", response)
+
+                        socketio.emit("agent_done", {"agent_id": agent_id, "success": True}, to=sid)
+                    except Exception as e:
+                        print(f"[ERROR] Follow-up failed: {e}")
+                        socketio.emit("agent_error", {"agent_id": agent_id, "error": str(e)}, to=sid)
+                    finally:
+                        sys.stdout = old_out
+                        sys.stderr = old_err
+                        _out.agent_id = None
+                        _err.agent_id = None
+
+            # ---- Phase 3: Cleanup (thread exiting) ----
+            ChatGPTSession._wait_for_response = _orig_wait
+            ChatGPTSession._navigate_to_new_chat = _orig_nav
+
         except Exception as e:
             socketio.emit("agent_error", {"agent_id": agent_id, "error": str(e)}, to=sid)
-            # If an error occurred during setup (before session stored), clean up
-            if session:
-                with _agent_sessions_lock:
-                    if agent_id not in _agent_sessions:
-                        try:
-                            session.__exit__(None, None, None)
-                        except Exception:
-                            pass
         finally:
+            # Close the browser session
+            if session:
+                try:
+                    session.__exit__(None, None, None)
+                except Exception:
+                    pass
+            with _agent_sessions_lock:
+                _agent_sessions.pop(agent_id, None)
             sys.stdout = old_out
             sys.stderr = old_err
             _out.agent_id = None
@@ -435,7 +510,7 @@ def on_run_agent(data):
 
 @socketio.on("followup_agent")
 def on_followup_agent(data):
-    """Send a follow-up message in an existing agent's ChatGPT session."""
+    """Push a follow-up task onto the agent's queue (runs on its own thread)."""
     agent_id = data.get("agent_id", "")
     prompt = data.get("prompt", "").strip()
     file_paths = data.get("file_paths", [])
@@ -455,143 +530,22 @@ def on_followup_agent(data):
         }, to=sid)
         return
 
-    session = session_info["session"]
-
-    def run_followup():
-        _out.agent_id = agent_id
-        _out.sid = sid
-        _err.agent_id = agent_id
-        _err.sid = sid
-
-        old_out, old_err = sys.stdout, sys.stderr
-        sys.stdout = _out
-        sys.stderr = _err
-
-        try:
-            import base64 as _b64
-            from core.session import ChatGPTSession
-            from core import chatgpt_selectors as _S
-
-            # Notify UI that agent is running again
-            socketio.emit("agent_running", {"agent_id": agent_id}, to=sid)
-
-            def _scroll_to_bottom():
-                try:
-                    if session._page and not session._page.is_closed():
-                        session._page.evaluate("""
-                            () => {
-                                const containers = document.querySelectorAll('[class*="react-scroll-to-bottom"]');
-                                for (const c of containers) c.scrollTop = c.scrollHeight;
-                                const main = document.querySelector('main');
-                                if (main) main.scrollTop = main.scrollHeight;
-                                const conv = document.querySelector('[class*="conversation-turn"]:last-child');
-                                if (conv) conv.scrollIntoView({ block: 'end' });
-                            }
-                        """)
-                except Exception:
-                    pass
-
-            def _take_ss():
-                try:
-                    if session._page and not session._page.is_closed():
-                        _scroll_to_bottom()
-                        png = session._page.screenshot(type="png", timeout=3000)
-                        if png:
-                            socketio.emit("agent_screenshot", {
-                                "agent_id": agent_id,
-                                "image": _b64.b64encode(png).decode("ascii"),
-                            }, to=sid)
-                except Exception:
-                    pass
-
-            # Patch _wait_for_response for this follow-up call too
-            _orig_wait = ChatGPTSession._wait_for_response
-
-            def _patched_wait_followup(self_sess, timeout_val=None):
-                import time as _time
-                _timeout = timeout_val if timeout_val is not None else _S.RESPONSE_TIMEOUT
-                print("[...] Waiting for response...")
-                deadline = _time.time() + _timeout
-                last_text_len = 0
-                stable_count = 0
-
-                while _time.time() < deadline:
-                    still_streaming = False
-                    for sel in _S.STOP_GENERATING_SELECTORS:
-                        stop_btn = self_sess._page.query_selector(sel)
-                        if stop_btn and stop_btn.is_visible():
-                            still_streaming = True
-                            break
-
-                    if not still_streaming:
-                        for sel in _S.RESPONSE_COMPLETE_INDICATORS:
-                            indicator = self_sess._page.query_selector(sel)
-                            if indicator and indicator.is_visible():
-                                _take_ss()
-                                print("[OK] Response complete.")
-                                return True
-
-                        current_len = 0
-                        for sel in _S.ASSISTANT_MESSAGE_SELECTORS:
-                            msgs = self_sess._page.query_selector_all(sel)
-                            if msgs:
-                                try:
-                                    current_len = len(msgs[-1].inner_text())
-                                except Exception:
-                                    pass
-                                break
-
-                        if current_len > 0 and current_len == last_text_len:
-                            stable_count += 1
-                        else:
-                            stable_count = 0
-                        last_text_len = current_len
-
-                        if stable_count >= 5 and current_len > 50:
-                            _take_ss()
-                            print("[OK] Response appears complete (content stable).")
-                            return True
-
-                    _take_ss()
-                    _time.sleep(1)
-
-                _take_ss()
-                print("[WARN] Response timeout -- may be incomplete.")
-                return False
-
-            ChatGPTSession._wait_for_response = _patched_wait_followup
-            try:
-                print(f"\n[FOLLOWUP] Sending to ChatGPT ({len(prompt)} chars)...")
-                response = session.followup(prompt, files=file_paths if file_paths else None)
-                _take_ss()
-                print(f"[OK] Follow-up response received ({len(response)} chars)")
-                socketio.emit("agent_done", {"agent_id": agent_id, "success": True}, to=sid)
-            finally:
-                ChatGPTSession._wait_for_response = _orig_wait
-
-        except Exception as e:
-            socketio.emit("agent_error", {"agent_id": agent_id, "error": str(e)}, to=sid)
-        finally:
-            sys.stdout = old_out
-            sys.stderr = old_err
-            _out.agent_id = None
-            _err.agent_id = None
-
-    t = threading.Thread(target=run_followup, daemon=True, name=f"{agent_id}-followup")
-    t.start()
+    # Push onto the agent's work queue -- the Playwright-owning thread picks it up
+    session_info["queue"].put({
+        "type": "followup",
+        "prompt": prompt,
+        "file_paths": file_paths,
+    })
 
 @socketio.on("close_agent")
 def on_close_agent(data):
-    """Close an agent's ChatGPT session when the panel is closed."""
+    """Send poison pill to the agent thread so it closes the session cleanly."""
     agent_id = data.get("agent_id", "")
     with _agent_sessions_lock:
-        session_info = _agent_sessions.pop(agent_id, None)
+        session_info = _agent_sessions.get(agent_id)
     if session_info:
-        try:
-            session_info["session"].__exit__(None, None, None)
-            print(f"[OK] Closed session for {agent_id}")
-        except Exception:
-            pass
+        # Poison pill tells the thread to exit its wait loop
+        session_info["queue"].put(None)
 
 @socketio.on("run_tests")
 def on_run_tests(data):
