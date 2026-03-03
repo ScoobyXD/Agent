@@ -1268,7 +1268,12 @@ async function sendPrompt() {
       fileNames = d.uploaded || [];
       filePaths = d.file_paths || [];
       for (const [n, c] of Object.entries(d.previews || {}))
-        fileCtx += '\n\nContents of ' + n + ':\n```\n' + c + '\n```';
+        fileCtx += '
+
+Contents of ' + n + ':
+```
+' + c + '
+```';
     } catch (e) { console.error(e); }
   }
 
