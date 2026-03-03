@@ -911,6 +911,75 @@ html,body{height:100%;overflow:hidden;font-family:'DM Sans',sans-serif;backgroun
 .attach-tag .rm{cursor:pointer;opacity:.5;font-size:13px}
 .attach-tag .rm:hover{opacity:1;color:var(--err)}
 
+/* File preview tiles (main bar) */
+.attach-preview{
+  display:flex;gap:6px;flex-wrap:wrap;padding:4px 0;
+}
+.attach-preview .file-tile{
+  position:relative;width:64px;height:64px;border-radius:8px;overflow:hidden;
+  background:var(--bg3);border:1px solid var(--brd);cursor:default;
+  display:flex;align-items:center;justify-content:center;flex-direction:column;
+}
+.attach-preview .file-tile img{
+  width:100%;height:100%;object-fit:cover;
+}
+.attach-preview .file-tile .file-icon{
+  font-size:20px;opacity:.6;
+}
+.attach-preview .file-tile .file-ext{
+  font-size:8px;color:var(--tx3);margin-top:2px;text-transform:uppercase;
+  max-width:56px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+.attach-preview .file-tile .file-name{
+  font-size:7px;color:var(--tx3);max-width:56px;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap;
+}
+.attach-preview .file-tile .tile-rm{
+  position:absolute;top:1px;right:1px;width:16px;height:16px;
+  background:rgba(0,0,0,.7);color:#fff;border:none;border-radius:50%;
+  font-size:10px;cursor:pointer;display:flex;align-items:center;
+  justify-content:center;opacity:0;transition:opacity .15s;line-height:1;
+}
+.attach-preview .file-tile:hover .tile-rm{opacity:1}
+
+/* Panel file previews (smaller) */
+.panel-attach-preview{
+  display:flex;gap:4px;flex-wrap:wrap;padding:3px 0;
+}
+.panel-attach-preview .file-tile{
+  position:relative;width:40px;height:40px;border-radius:6px;overflow:hidden;
+  background:var(--bg3);border:1px solid var(--brd);cursor:default;
+  display:flex;align-items:center;justify-content:center;flex-direction:column;
+}
+.panel-attach-preview .file-tile img{
+  width:100%;height:100%;object-fit:cover;
+}
+.panel-attach-preview .file-tile .file-icon{font-size:14px;opacity:.6}
+.panel-attach-preview .file-tile .file-ext{
+  font-size:6px;color:var(--tx3);text-transform:uppercase;
+}
+.panel-attach-preview .file-tile .tile-rm{
+  position:absolute;top:0;right:0;width:13px;height:13px;
+  background:rgba(0,0,0,.7);color:#fff;border:none;border-radius:50%;
+  font-size:8px;cursor:pointer;display:flex;align-items:center;
+  justify-content:center;opacity:0;transition:opacity .15s;line-height:1;
+}
+.panel-attach-preview .file-tile:hover .tile-rm{opacity:1}
+
+/* Drop overlay */
+.drop-overlay{
+  display:none;position:absolute;inset:0;z-index:100;
+  background:rgba(99,102,241,.12);border:2px dashed var(--acc);border-radius:8px;
+  pointer-events:none;align-items:center;justify-content:center;
+}
+.drop-overlay .drop-label{
+  background:var(--bg2);padding:8px 18px;border-radius:8px;
+  color:var(--acc);font-size:13px;font-weight:600;
+  border:1px solid var(--acc);pointer-events:none;
+}
+.agent-panel.drag-over .drop-overlay{display:flex}
+.prompt-bar.drag-over{outline:2px dashed var(--acc);outline-offset:-2px;border-radius:8px}
+
 ::-webkit-scrollbar{width:5px;height:5px}
 ::-webkit-scrollbar-track{background:transparent}
 ::-webkit-scrollbar-thumb{background:var(--brd);border-radius:3px}
@@ -999,8 +1068,8 @@ html,body{height:100%;overflow:hidden;font-family:'DM Sans',sans-serif;backgroun
 </div>
 
 <!-- INPUT BAR -->
-<div class="input-bar">
-  <div id="attachTags" class="attach-tags"></div>
+<div class="input-bar prompt-bar">
+  <div id="attachPreview" class="attach-preview"></div>
   <div class="input-wrap">
     <button class="attach-btn" onclick="document.getElementById('fileInput').click()" title="Attach files">
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/></svg>
@@ -1137,6 +1206,8 @@ function createPanel(id, prompt, isTest) {
       '<button class="head-btn" onclick="toggleMax(\'' + id + '\')" title="Maximize">&#9634;</button>' +
       '<button class="head-btn" onclick="closePanel(\'' + id + '\')" title="Close">&times;</button>' +
     '</div>' +
+    // Drop overlay for file drag
+    '<div class="drop-overlay"><span class="drop-label">Drop files here</span></div>' +
     // Body: terminal left, browser right (split top/bottom)
     '<div class="agent-body">' +
       '<div class="agent-terminal"></div>' +
@@ -1155,7 +1226,7 @@ function createPanel(id, prompt, isTest) {
     '<div class="agent-status running">Running...</div>' +
     // In-panel input bar for follow-ups
     '<div class="panel-input-bar">' +
-      '<div class="panel-attach-tags" data-agent="' + id + '"></div>' +
+      '<div class="panel-attach-preview" data-agent="' + id + '"></div>' +
       '<div class="panel-input-wrap">' +
         '<button class="p-attach-btn" onclick="panelAttach(\'' + id + '\')" title="Attach file">' +
           '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/></svg>' +
@@ -1174,6 +1245,7 @@ function createPanel(id, prompt, isTest) {
   makeDraggable(panel, head);
   makeResizable(panel);
   observeTerminalSize(panel);
+  setupPanelDrop(panel, id);
 
   agents[id] = {
     el: panel,
@@ -1182,7 +1254,8 @@ function createPanel(id, prompt, isTest) {
     status: panel.querySelector('.agent-status'),
     browserImg: panel.querySelector('.agent-browser-top img'),
     browserPlaceholder: panel.querySelector('.agent-browser-top .placeholder'),
-    panelFiles: [],  // attached files for follow-up
+    panelFiles: [],      // attached File objects for follow-up
+    panelPreviews: [],   // {file, url, isImage} for rendering previews
   };
 
   updateGlobalStatus();
@@ -1360,22 +1433,120 @@ function panelAttach(id) {
 function panelFiles(id, fl) {
   const a = agents[id];
   if (!a) return;
-  for (const f of fl) a.panelFiles.push(f);
-  updatePanelAttachTags(id);
+  for (const f of fl) addPanelFile(id, f);
 }
-function updatePanelAttachTags(id) {
+
+function addPanelFile(id, file) {
   const a = agents[id];
   if (!a) return;
-  const tags = a.el.querySelector('.panel-attach-tags');
-  tags.innerHTML = a.panelFiles.map((f, i) =>
-    '<div class="attach-tag">' + esc(f.name) + '<span class="rm" onclick="rmPanelFile(\'' + id + '\',' + i + ')">&times;</span></div>'
-  ).join('');
+  a.panelFiles.push(file);
+  const isImage = file.type.startsWith('image/');
+  const url = isImage ? URL.createObjectURL(file) : null;
+  a.panelPreviews.push({ file, url, isImage });
+  renderPanelPreviews(id);
 }
+
+function renderPanelPreviews(id) {
+  const a = agents[id];
+  if (!a) return;
+  const container = a.el.querySelector('.panel-attach-preview');
+  if (!container) return;
+  container.innerHTML = a.panelPreviews.map((p, i) => {
+    const ext = p.file.name.split('.').pop() || '?';
+    if (p.isImage) {
+      return '<div class="file-tile" title="' + esc(p.file.name) + '">' +
+        '<img src="' + p.url + '" />' +
+        '<button class="tile-rm" onclick="rmPanelFile(\'' + id + '\',' + i + ')">&times;</button>' +
+      '</div>';
+    }
+    return '<div class="file-tile" title="' + esc(p.file.name) + '">' +
+      '<span class="file-icon">' + fileIcon(ext) + '</span>' +
+      '<span class="file-ext">' + esc(ext) + '</span>' +
+      '<button class="tile-rm" onclick="rmPanelFile(\'' + id + '\',' + i + ')">&times;</button>' +
+    '</div>';
+  }).join('');
+}
+
 function rmPanelFile(id, i) {
   const a = agents[id];
   if (!a) return;
+  if (a.panelPreviews[i]?.url) URL.revokeObjectURL(a.panelPreviews[i].url);
   a.panelFiles.splice(i, 1);
-  updatePanelAttachTags(id);
+  a.panelPreviews.splice(i, 1);
+  renderPanelPreviews(id);
+}
+
+// Setup drag/drop on an agent panel
+function setupPanelDrop(panel, id) {
+  let dragDepth = 0;
+  panel.addEventListener('dragenter', e => {
+    e.preventDefault();
+    dragDepth++;
+    panel.classList.add('drag-over');
+  });
+  panel.addEventListener('dragleave', e => {
+    dragDepth--;
+    if (dragDepth <= 0) { dragDepth = 0; panel.classList.remove('drag-over'); }
+  });
+  panel.addEventListener('dragover', e => { e.preventDefault(); });
+  panel.addEventListener('drop', e => {
+    e.preventDefault(); e.stopPropagation();
+    dragDepth = 0;
+    panel.classList.remove('drag-over');
+    if (e.dataTransfer.files.length) {
+      for (const f of e.dataTransfer.files) addPanelFile(id, f);
+    }
+  });
+}
+
+// === FILE ICON HELPER ===
+function fileIcon(ext) {
+  const map = {
+    pdf:'&#128196;', doc:'&#128196;', docx:'&#128196;',
+    xls:'&#128202;', xlsx:'&#128202;', csv:'&#128202;',
+    py:'&#128187;', js:'&#128187;', ts:'&#128187;', c:'&#128187;', cpp:'&#128187;', rs:'&#128187;',
+    zip:'&#128230;', rar:'&#128230;', '7z':'&#128230;', tar:'&#128230;', gz:'&#128230;',
+    txt:'&#128209;', md:'&#128209;', log:'&#128209;', json:'&#128209;',
+  };
+  return map[ext.toLowerCase()] || '&#128196;';
+}
+
+// === MAIN BAR FILE PREVIEWS ===
+let mainPreviews = [];  // {file, url, isImage}
+
+function addMainFile(file) {
+  attachedFiles.push(file);
+  const isImage = file.type.startsWith('image/');
+  const url = isImage ? URL.createObjectURL(file) : null;
+  mainPreviews.push({ file, url, isImage });
+  renderMainPreviews();
+}
+
+function renderMainPreviews() {
+  const container = document.getElementById('attachPreview');
+  if (!container) return;
+  container.innerHTML = mainPreviews.map((p, i) => {
+    const ext = p.file.name.split('.').pop() || '?';
+    if (p.isImage) {
+      return '<div class="file-tile" title="' + esc(p.file.name) + '">' +
+        '<img src="' + p.url + '" />' +
+        '<button class="tile-rm" onclick="rmMainFile(' + i + ')">&times;</button>' +
+      '</div>';
+    }
+    return '<div class="file-tile" title="' + esc(p.file.name) + '">' +
+      '<span class="file-icon">' + fileIcon(ext) + '</span>' +
+      '<span class="file-ext">' + esc(ext) + '</span>' +
+      '<span class="file-name">' + esc(p.file.name) + '</span>' +
+      '<button class="tile-rm" onclick="rmMainFile(' + i + ')">&times;</button>' +
+    '</div>';
+  }).join('');
+}
+
+function rmMainFile(i) {
+  if (mainPreviews[i]?.url) URL.revokeObjectURL(mainPreviews[i].url);
+  attachedFiles.splice(i, 1);
+  mainPreviews.splice(i, 1);
+  renderMainPreviews();
 }
 async function panelSend(id) {
   const a = agents[id];
@@ -1414,7 +1585,9 @@ async function panelSend(id) {
   textarea.value = '';
   textarea.style.height = 'auto';
   a.panelFiles = [];
-  updatePanelAttachTags(id);
+  a.panelPreviews.forEach(p => { if (p.url) URL.revokeObjectURL(p.url); });
+  a.panelPreviews = [];
+  renderPanelPreviews(id);
 }
 
 // === SEND ===
@@ -1449,8 +1622,10 @@ async function sendPrompt() {
 
   input.value = '';
   input.style.height = 'auto';
+  mainPreviews.forEach(p => { if (p.url) URL.revokeObjectURL(p.url); });
+  mainPreviews = [];
   attachedFiles = [];
-  updateAttachTags();
+  renderMainPreviews();
 }
 
 function runTests() { socket.emit('run_tests', {}); }
@@ -1460,24 +1635,48 @@ function handleKey(e) {
 }
 function autoResize(el) { el.style.height = 'auto'; el.style.height = Math.min(el.scrollHeight, 150) + 'px'; }
 function useExample(el) { document.getElementById('promptInput').value = el.textContent; document.getElementById('promptInput').focus(); }
-function handleFiles(fl) { for (const f of fl) attachedFiles.push(f); updateAttachTags(); document.getElementById('fileInput').value = ''; }
-function updateAttachTags() {
-  document.getElementById('attachTags').innerHTML = attachedFiles.map((f, i) =>
-    '<div class="attach-tag">' + esc(f.name) + '<span class="rm" onclick="rmFile(' + i + ')">&times;</span></div>'
-  ).join('');
-}
-function rmFile(i) { attachedFiles.splice(i, 1); updateAttachTags(); }
+function handleFiles(fl) { for (const f of fl) addMainFile(f); document.getElementById('fileInput').value = ''; }
+function rmFile(i) { rmMainFile(i); }
 function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
 
-// Paste / drag-drop
+// Paste handler — also creates previews
 document.addEventListener('paste', e => {
   for (const item of (e.clipboardData?.items || [])) {
-    if (item.type.startsWith('image/')) { const f = item.getAsFile(); if (f) { attachedFiles.push(f); updateAttachTags(); } }
+    if (item.type.startsWith('image/')) {
+      const f = item.getAsFile();
+      if (f) addMainFile(f);
+    }
   }
 });
+
+// Main bar drag/drop with visual feedback
+const promptBar = document.querySelector('.prompt-bar');
+let mainDragDepth = 0;
+promptBar.addEventListener('dragenter', e => {
+  e.preventDefault(); mainDragDepth++;
+  promptBar.classList.add('drag-over');
+});
+promptBar.addEventListener('dragleave', e => {
+  mainDragDepth--;
+  if (mainDragDepth <= 0) { mainDragDepth = 0; promptBar.classList.remove('drag-over'); }
+});
+promptBar.addEventListener('dragover', e => { e.preventDefault(); });
+promptBar.addEventListener('drop', e => {
+  e.preventDefault(); mainDragDepth = 0;
+  promptBar.classList.remove('drag-over');
+  if (e.dataTransfer.files.length) handleFiles(e.dataTransfer.files);
+});
+
+// Workbench-level drop fallback (files dropped outside a panel go to main bar)
 const wb = document.querySelector('.workbench');
 wb.addEventListener('dragover', e => e.preventDefault());
-wb.addEventListener('drop', e => { e.preventDefault(); if (e.dataTransfer.files.length) handleFiles(e.dataTransfer.files); });
+wb.addEventListener('drop', e => {
+  // Only handle if not caught by a panel
+  if (!e.defaultPrevented) {
+    e.preventDefault();
+    if (e.dataTransfer.files.length) handleFiles(e.dataTransfer.files);
+  }
+});
 
 // === DROPDOWNS ===
 function toggleDropdown(id) {
