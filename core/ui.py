@@ -210,6 +210,67 @@ def api_file(subdir, filename):
             return jsonify({"content": "(binary file)"}), 200
     return jsonify({"error": "File not found"}), 404
 
+@app.route("/api/clear/<path:folder>", methods=["POST"])
+def api_clear(folder):
+    """Clear all files in a folder (history, programs, or outputs)."""
+    import shutil as _shutil
+    dir_map = {"history": RAW_MD_DIR, "programs": PROGRAMS_DIR, "outputs": OUTPUTS_DIR}
+    target = dir_map.get(folder)
+    if not target or not target.exists():
+        return jsonify({"error": "Invalid folder"}), 400
+    count = 0
+    for f in target.iterdir():
+        if f.is_file():
+            try:
+                f.unlink()
+                count += 1
+            except Exception:
+                pass
+    return jsonify({"cleared": count})
+
+@app.route("/api/agent_files/<agent_id>/<folder>")
+def api_agent_files(agent_id, folder):
+    """List files belonging to a specific agent by matching timestamp/name patterns.
+
+    The agent's raw_md file is stored in _agent_sessions. For programs and outputs,
+    we match files created during the agent's run by timestamp range.
+    """
+    dir_map = {"history": RAW_MD_DIR, "programs": PROGRAMS_DIR, "outputs": OUTPUTS_DIR}
+    target = dir_map.get(folder)
+    if not target or not target.exists():
+        return jsonify([])
+
+    # Get agent session info to find its md_path
+    with _agent_sessions_lock:
+        si = _agent_sessions.get(agent_id, {})
+    md_path = si.get("md_path")
+    start_time = si.get("start_time")
+
+    files = []
+    if folder == "history" and md_path and md_path.exists():
+        # Just return the agent's own log file
+        try:
+            content = md_path.read_text(encoding="utf-8", errors="replace")
+            prompt_match = re.search(r"\*\*Prompt\*\*:\s*(.+)", content)
+            prompt = prompt_match.group(1) if prompt_match else md_path.stem
+            files.append({
+                "filename": md_path.name,
+                "prompt": prompt[:120],
+                "date": datetime.fromtimestamp(md_path.stat().st_mtime).strftime("%Y-%m-%d %H:%M"),
+            })
+        except Exception:
+            pass
+    elif start_time and target.exists():
+        # Match files created after agent start time
+        for f in sorted(target.iterdir(), reverse=True):
+            if f.is_file() and f.stat().st_mtime >= start_time:
+                files.append({
+                    "name": f.name,
+                    "size": f.stat().st_size,
+                    "modified": datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M"),
+                })
+    return jsonify(files[:50])
+
 @app.route("/api/upload", methods=["POST"])
 def api_upload():
     UPLOADS_DIR.mkdir(exist_ok=True)
@@ -287,6 +348,7 @@ def on_run_agent(data):
 
         session = None
         md_path = None
+        agent_start_time = time.time()
         try:
             from main import run_pipeline
             from core.session import ChatGPTSession
@@ -294,7 +356,38 @@ def on_run_agent(data):
             import base64 as _b64
 
             # --- Create session on THIS thread so Playwright is happy ---
-            session = ChatGPTSession(headed=not headless)
+            # Each agent gets its own browser profile to avoid lock conflicts.
+            # We copy essential files from the main profile so ChatGPT login
+            # persists across all instances.
+            import shutil as _shutil
+            main_profile = ROOT / ".browser_profile"
+            agent_profile = ROOT / ".browser_profiles" / agent_id
+            agent_profile.mkdir(parents=True, exist_ok=True)
+
+            # Copy login/cookie files from main profile if they exist
+            if main_profile.exists():
+                for fname in ["Cookies", "Cookies-journal",
+                              "Login Data", "Login Data-journal",
+                              "Local State", "Preferences", "Secure Preferences"]:
+                    src = main_profile / fname
+                    if src.exists():
+                        try:
+                            _shutil.copy2(str(src), str(agent_profile / fname))
+                        except Exception:
+                            pass
+                # Also copy Default directory (contains cookies in some Chromium versions)
+                src_default = main_profile / "Default"
+                dst_default = agent_profile / "Default"
+                if src_default.exists() and not dst_default.exists():
+                    try:
+                        _shutil.copytree(str(src_default), str(dst_default),
+                                        ignore=_shutil.ignore_patterns(
+                                            "Cache", "Code Cache", "GPUCache",
+                                            "Service Worker", "*.log", "*.tmp"))
+                    except Exception:
+                        pass
+
+            session = ChatGPTSession(headed=not headless, profile_dir=agent_profile)
             session.__enter__()
 
             # --- Auto-scroll + screenshot helpers (closures over agent_id/sid) ---
@@ -426,6 +519,7 @@ def on_run_agent(data):
                     "target": target if target != "auto" else None,
                     "timeout": timeout,
                     "max_retries": max_retries,
+                    "start_time": agent_start_time,
                 }
 
             socketio.emit("agent_done", {"agent_id": agent_id, "success": result}, to=sid)
@@ -683,8 +777,13 @@ html,body{height:100%;overflow:hidden;font-family:'DM Sans',sans-serif;backgroun
 .dropdown-panel.open{display:flex;flex-direction:column}
 .dropdown-header{
   padding:10px 14px;border-bottom:1px solid var(--brd);font-size:13px;font-weight:600;
-  display:flex;align-items:center;gap:8px;
+  display:flex;align-items:center;justify-content:space-between;gap:8px;
 }
+.clear-btn{
+  background:none;border:1px solid var(--err);color:var(--err);font-size:9px;
+  padding:2px 8px;border-radius:4px;cursor:pointer;font-weight:400;
+}
+.clear-btn:hover{background:var(--err);color:#fff}
 .dropdown-list{flex:1;overflow-y:auto;padding:4px}
 .dropdown-item{
   padding:8px 12px;border-radius:7px;cursor:pointer;font-size:12px;
@@ -692,6 +791,32 @@ html,body{height:100%;overflow:hidden;font-family:'DM Sans',sans-serif;backgroun
 }
 .dropdown-item:hover{background:var(--bg3);color:var(--tx)}
 .dropdown-item .meta{font-size:10px;color:var(--tx3);margin-top:2px}
+
+/* Panel mini file buttons */
+.panel-file-btns{
+  display:flex;gap:2px;padding:2px 6px;border-top:1px solid var(--brd);
+  background:var(--bg2);
+}
+.panel-file-btns button{
+  background:none;border:none;color:var(--tx3);font-size:9px;padding:2px 6px;
+  cursor:pointer;border-radius:3px;
+}
+.panel-file-btns button:hover{background:var(--bg3);color:var(--tx)}
+.panel-mini-dropdown{
+  position:absolute;bottom:100%;left:0;right:0;
+  background:var(--bg2);border:1px solid var(--brd);border-radius:8px;
+  max-height:200px;overflow-y:auto;z-index:50;display:none;
+  box-shadow:0 -4px 12px rgba(0,0,0,.3);
+}
+.panel-mini-dropdown.open{display:block}
+.panel-mini-dropdown .pmd-header{
+  padding:5px 8px;font-size:9px;color:var(--tx3);border-bottom:1px solid var(--brd);
+  font-weight:600;
+}
+.panel-mini-dropdown .pmd-item{
+  padding:4px 8px;font-size:10px;color:var(--tx2);cursor:pointer;
+}
+.panel-mini-dropdown .pmd-item:hover{background:var(--bg3);color:var(--tx)}
 
 /* === FILE VIEWER MODAL === */
 .modal-overlay{
@@ -998,7 +1123,7 @@ html,body{height:100%;overflow:hidden;font-family:'DM Sans',sans-serif;backgroun
   <div class="dropdown-wrap">
     <button class="tb-btn" onclick="toggleDropdown('historyDrop')">History</button>
     <div class="dropdown-panel" id="historyDrop">
-      <div class="dropdown-header">Pipeline History (raw_md/)</div>
+      <div class="dropdown-header">Pipeline History <button class="clear-btn" onclick="clearFolder('history','historyList')">Clear All</button></div>
       <div class="dropdown-list" id="historyList"></div>
     </div>
   </div>
@@ -1006,7 +1131,7 @@ html,body{height:100%;overflow:hidden;font-family:'DM Sans',sans-serif;backgroun
   <div class="dropdown-wrap">
     <button class="tb-btn" onclick="toggleDropdown('programsDrop')">Programs</button>
     <div class="dropdown-panel" id="programsDrop">
-      <div class="dropdown-header">Saved Programs</div>
+      <div class="dropdown-header">Saved Programs <button class="clear-btn" onclick="clearFolder('programs','programsList')">Clear All</button></div>
       <div class="dropdown-list" id="programsList"></div>
     </div>
   </div>
@@ -1014,7 +1139,7 @@ html,body{height:100%;overflow:hidden;font-family:'DM Sans',sans-serif;backgroun
   <div class="dropdown-wrap">
     <button class="tb-btn" onclick="toggleDropdown('outputsDrop')">Outputs</button>
     <div class="dropdown-panel" id="outputsDrop">
-      <div class="dropdown-header">Execution Outputs</div>
+      <div class="dropdown-header">Execution Outputs <button class="clear-btn" onclick="clearFolder('outputs','outputsList')">Clear All</button></div>
       <div class="dropdown-list" id="outputsList"></div>
     </div>
   </div>
@@ -1224,6 +1349,13 @@ function createPanel(id, prompt, isTest) {
     '</div>' +
     // Status bar
     '<div class="agent-status running">Running...</div>' +
+    // Per-panel file buttons
+    '<div class="panel-file-btns" style="position:relative">' +
+      '<button onclick="togglePanelDrop(\'' + id + '\',\'history\')">History</button>' +
+      '<button onclick="togglePanelDrop(\'' + id + '\',\'programs\')">Programs</button>' +
+      '<button onclick="togglePanelDrop(\'' + id + '\',\'outputs\')">Outputs</button>' +
+      '<div class="panel-mini-dropdown" data-agent="' + id + '"></div>' +
+    '</div>' +
     // In-panel input bar for follow-ups
     '<div class="panel-input-bar">' +
       '<div class="panel-attach-preview" data-agent="' + id + '"></div>' +
@@ -1741,6 +1873,84 @@ async function viewFile(dir, name) {
   } catch (e) { document.getElementById('modalBody').textContent = 'Error: ' + e; }
 }
 function closeModal() { document.getElementById('modalOverlay').classList.remove('open'); }
+
+// === CLEAR FOLDER ===
+async function clearFolder(folder, listId) {
+  if (!confirm('Clear all files in ' + folder + '?')) return;
+  try {
+    const res = await fetch('/api/clear/' + folder, { method: 'POST' });
+    const d = await res.json();
+    document.getElementById(listId).innerHTML =
+      '<div class="dropdown-item" style="color:var(--tx3)">Cleared ' + (d.cleared || 0) + ' files</div>';
+  } catch (e) {
+    alert('Error clearing: ' + e);
+  }
+}
+
+// === PER-PANEL FILE BUTTONS ===
+function togglePanelDrop(id, folder) {
+  const a = agents[id];
+  if (!a) return;
+  const dd = a.el.querySelector('.panel-mini-dropdown');
+  if (dd.classList.contains('open') && dd.dataset.folder === folder) {
+    dd.classList.remove('open');
+    return;
+  }
+  dd.dataset.folder = folder;
+  dd.classList.add('open');
+  dd.innerHTML = '<div class="pmd-header">Loading...</div>';
+  loadPanelFiles(id, folder);
+}
+
+async function loadPanelFiles(id, folder) {
+  const a = agents[id];
+  if (!a) return;
+  const dd = a.el.querySelector('.panel-mini-dropdown');
+
+  try {
+    const res = await fetch('/api/agent_files/' + id + '/' + folder);
+    const data = await res.json();
+
+    if (!data.length) {
+      dd.innerHTML = '<div class="pmd-header">' + folder + '</div>' +
+        '<div class="pmd-item" style="color:var(--tx3)">No files yet</div>';
+      return;
+    }
+
+    let html = '<div class="pmd-header">' + folder + '</div>';
+    if (folder === 'history') {
+      data.forEach(item => {
+        html += '<div class="pmd-item" onclick="viewFile(\'raw_md\',\'' + esc(item.filename) + '\');closePanelDrop(\'' + id + '\')">' +
+          esc(item.prompt || item.filename) + '</div>';
+      });
+    } else {
+      const dir = folder === 'programs' ? 'programs' : 'outputs';
+      data.forEach(item => {
+        html += '<div class="pmd-item" onclick="viewFile(\'' + dir + '\',\'' + esc(item.name) + '\');closePanelDrop(\'' + id + '\')">' +
+          esc(item.name) + '<span style="color:var(--tx3);font-size:8px;margin-left:4px">' +
+          (item.size / 1024).toFixed(1) + 'KB</span></div>';
+      });
+    }
+    dd.innerHTML = html;
+  } catch (e) {
+    dd.innerHTML = '<div class="pmd-header">' + folder + '</div>' +
+      '<div class="pmd-item" style="color:var(--err)">Error loading</div>';
+  }
+}
+
+function closePanelDrop(id) {
+  const a = agents[id];
+  if (!a) return;
+  const dd = a.el.querySelector('.panel-mini-dropdown');
+  if (dd) dd.classList.remove('open');
+}
+
+// Close panel dropdown on outside click
+document.addEventListener('click', e => {
+  if (!e.target.closest('.panel-file-btns')) {
+    document.querySelectorAll('.panel-mini-dropdown.open').forEach(d => d.classList.remove('open'));
+  }
+});
 
 function updateGlobalStatus() {
   const dot = document.getElementById('statusDot');

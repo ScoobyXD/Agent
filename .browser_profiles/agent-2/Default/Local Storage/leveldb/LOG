@@ -1,0 +1,16 @@
+2026/03/03-14:58:01.094 80b4 Reusing MANIFEST C:\Users\Jonat\Agent\.browser_profiles\agent-2\Default\Local Storage\leveldb/MANIFEST-000001
+2026/03/03-14:59:01.152 ac98 Level-0 table #1007: started
+2026/03/03-14:59:01.171 ac98 Level-0 table #1007: 21377 bytes OK
+2026/03/03-14:59:01.175 ac98 Delete type=0 #1005
+2026/03/03-14:59:01.177 ac98 Compacting 4@0 + 1@1 files
+2026/03/03-14:59:01.199 ac98 Generated table #1008@0: 22 keys, 92523 bytes
+2026/03/03-14:59:01.199 ac98 Compacted 4@0 + 1@1 files => 92523 bytes
+2026/03/03-14:59:01.200 ac98 compacted to: files[ 0 1 1 0 0 0 0 ]
+2026/03/03-14:59:01.202 ac98 Delete type=2 #997
+2026/03/03-14:59:01.202 ac98 Delete type=2 #999
+2026/03/03-14:59:01.202 ac98 Delete type=2 #1001
+2026/03/03-14:59:01.202 ac98 Delete type=2 #1003
+2026/03/03-14:59:01.203 ac98 Delete type=2 #1007
+2026/03/03-15:00:25.165 ac98 Level-0 table #1010: started
+2026/03/03-15:00:25.178 ac98 Level-0 table #1010: 67990 bytes OK
+2026/03/03-15:00:25.181 ac98 Delete type=0 #1006

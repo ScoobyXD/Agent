@@ -935,7 +935,12 @@ def _run_pipeline_inner(session, initial_prompt, prompt, resolved,
 
     for attempt in range(1, max_retries + 2):  # attempt 1 = first try
         print(f"\n{'='*60}")
-        print(f"[{'RETRY ' + str(attempt-1) if attempt > 1 else 'PROMPT 1'}]")
+        if attempt == 1:
+            print(f"[PROMPT 1]")
+        elif attempt == 2:
+            print(f"[VERIFY 1]")
+        else:
+            print(f"[RETRY {attempt - 2}]")
         print(f"{'='*60}")
 
         # Log what we're sending to the LLM
@@ -1156,7 +1161,12 @@ def run_followup_pipeline(session, followup_prompt: str, md_path=None,
 
     for attempt in range(1, max_retries + 2):
         print(f"\n{'='*60}")
-        label = "FOLLOWUP" if is_first else f"RETRY {attempt - 1}"
+        if is_first:
+            label = "FOLLOWUP"
+        elif attempt == 2:
+            label = "VERIFY 1"
+        else:
+            label = f"RETRY {attempt - 2}"
         print(f"[{label}]")
         print(f"{'='*60}")
 
