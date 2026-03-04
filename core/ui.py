@@ -2382,16 +2382,13 @@ function runTests() { socket.emit('run_tests', {}); }
 
 // === PUSH TO GITHUB ===
 async function pushToGithub() {
-  // Quick commit message
-  const msg = prompt('Commit message:', 'Update from Agent');
-  if (!msg) return;
+  showToast('Pushing to GitHub...');
 
-  // First try the simple push
   try {
     const res = await fetch('/api/git_push', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ message: msg }),
+      body: JSON.stringify({ message: 'auto-push' }),
     });
     const d = await res.json();
 
@@ -2400,21 +2397,10 @@ async function pushToGithub() {
       return;
     }
 
-    // Push failed -- build error summary and send through the agent system
-    let errorSummary = 'Git push failed. Here are the results:\n\n';
-    for (const r of d.results) {
-      errorSummary += r.cmd + ' (exit ' + r.exit + ')\n';
-      if (r.stdout) errorSummary += 'STDOUT: ' + r.stdout.trim() + '\n';
-      if (r.stderr) errorSummary += 'STDERR: ' + r.stderr.trim() + '\n';
-      errorSummary += '\n';
-    }
-
-    // Spawn an agent to fix it
+    // Push failed -- spawn an agent to fix it
     showToast('Push failed - spawning agent to fix...');
-    const fixPrompt = 'Please push my changes to github';
-
     socket.emit('run_agent', {
-      prompt: fixPrompt,
+      prompt: 'Please push my changes to github',
       target: 'local',
       max_retries: 3,
       timeout: 30,

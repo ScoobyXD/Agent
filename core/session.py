@@ -127,17 +127,64 @@ class ChatGPTSession:
     def switch_model(self, model_key: str):
         """Switch to a different model and start a new conversation.
 
-        Reuses the same browser context (no new Playwright instance).
-        Navigates to a new chat URL with the target model parameter.
+        Prefers using the DOM model picker (no page navigation needed).
+        Falls back to navigating to a new URL if the picker isn't found.
 
         Args:
             model_key: Model name from selectors.MODELS ('instant', 'thinking', 'auto').
         """
         old_model = self._model
         self._model = model_key
+
+        # Try DOM picker first -- faster and more reliable since we're
+        # already on ChatGPT and don't need to navigate/reload.
+        if self._try_switch_via_picker(model_key):
+            print(f"[OK] Switched model: {old_model} -> {model_key} (via picker)")
+            return
+
+        # Fallback: navigate to new chat URL with model param
+        print(f"  [MODEL] Picker method failed, navigating to new chat URL...")
         self._navigate_to_new_chat()
         self._in_conversation = False
-        print(f"[OK] Switched model: {old_model} -> {model_key}")
+        print(f"[OK] Switched model: {old_model} -> {model_key} (via navigation)")
+
+    def _try_switch_via_picker(self, model_key: str) -> bool:
+        """Try to switch model using the DOM model picker dropdown.
+
+        Returns True if successful, False if picker couldn't be found/used.
+        """
+        page = self._page
+
+        # First, start a new conversation (clears current chat)
+        try:
+            # Look for "New chat" button or similar
+            new_chat_selectors = [
+                'a[href="/"]',
+                'nav a:first-child',
+                'button:has-text("New chat")',
+            ]
+            for sel in new_chat_selectors:
+                try:
+                    btn = page.query_selector(sel)
+                    if btn and btn.is_visible():
+                        btn.click()
+                        time.sleep(1.5)
+                        break
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        # Wait for the page to settle
+        self._wait_for_chat_ready(timeout=10)
+
+        # Now use _ensure_model_selected to pick the right model
+        try:
+            self._ensure_model_selected()
+            self._in_conversation = False
+            return True
+        except Exception:
+            return False
 
     # --- Internals ---
 
@@ -222,8 +269,13 @@ class ChatGPTSession:
         url = S.model_url(self._model)
         self._page.goto(url, wait_until="domcontentloaded",
                         timeout=S.NAVIGATION_TIMEOUT * 1000)
-        self._page.wait_for_selector(S.PROMPT_TEXTAREA,
-                                     timeout=S.NAVIGATION_TIMEOUT * 1000)
+
+        # ChatGPT may show different page states after navigation:
+        #   1. Direct new-chat page with #prompt-textarea visible
+        #   2. Welcome/landing page ("Good to see you") with a different input
+        #   3. Redirect that needs extra time to settle
+        # Wait for ANY interactive element, then ensure we can type.
+        self._wait_for_chat_ready()
 
         # If a specific model was requested (not 'auto'), verify via DOM
         # that the correct model is active. If not, click the picker to
@@ -232,6 +284,74 @@ class ChatGPTSession:
             self._ensure_model_selected()
 
         print(f"[OK] ChatGPT loaded (model={self._model}), ready for prompt.")
+
+    def _wait_for_chat_ready(self, timeout: int = None):
+        """Wait for ChatGPT to be ready for input.
+
+        Handles multiple page states: direct chat, welcome page,
+        redirects. Tries multiple selectors and clicks through
+        landing pages if needed.
+        """
+        _timeout = timeout or S.NAVIGATION_TIMEOUT
+        page = self._page
+        deadline = time.time() + _timeout
+
+        # Selectors that indicate the page is ready for input
+        ready_selectors = [
+            S.PROMPT_TEXTAREA,                     # Standard chat input
+            'div[contenteditable="true"]',          # Rich text input variant
+            'textarea[placeholder*="Ask"]',         # "Ask anything" variant
+            'div[id="prompt-textarea"]',            # ID-based fallback
+            'form textarea',                        # Generic form textarea
+        ]
+
+        while time.time() < deadline:
+            for sel in ready_selectors:
+                try:
+                    el = page.query_selector(sel)
+                    if el and el.is_visible():
+                        # Found a ready input -- click it to focus
+                        try:
+                            el.click()
+                        except Exception:
+                            pass
+                        time.sleep(0.5)
+                        return
+                except Exception:
+                    continue
+
+            # Check if we're on a welcome/landing page and need to
+            # click something to get to the chat input
+            try:
+                # ChatGPT sometimes shows "Ask anything" as a clickable div
+                ask_btn = page.query_selector('div:has-text("Ask anything")')
+                if ask_btn and ask_btn.is_visible():
+                    ask_btn.click()
+                    time.sleep(1)
+                    continue
+            except Exception:
+                pass
+
+            time.sleep(1)
+
+        # Last resort: try clicking the center of the page where the
+        # input usually is, then check one more time
+        try:
+            vp = page.viewport_size
+            if vp:
+                page.mouse.click(vp["width"] // 2, int(vp["height"] * 0.85))
+                time.sleep(1)
+                for sel in ready_selectors:
+                    try:
+                        el = page.query_selector(sel)
+                        if el and el.is_visible():
+                            return
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+        print(f"  [WARN] Could not confirm chat input ready (proceeding anyway)")
 
     def _ensure_model_selected(self):
         """Use the DOM model picker to verify/select the active model.
