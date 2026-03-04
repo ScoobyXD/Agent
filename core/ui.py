@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ui.py -- Workbench UI for VerifyBot Agent.
+ui.py -- Workbench UI for Agent.
 
 Launch with:
     python main.py          (auto-launches this)
@@ -75,7 +75,7 @@ os.environ["PYTHONUTF8"] = "1"
 # ---------------------------------------------------------------------------
 
 app = Flask(__name__, static_folder=None)
-app.config["SECRET_KEY"] = "verifybot-" + str(os.getpid())
+app.config["SECRET_KEY"] = "agent-" + str(os.getpid())
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
 # ---------------------------------------------------------------------------
@@ -353,7 +353,7 @@ def api_agent_files(agent_id, folder):
 def api_git_push():
     """Run git add, commit, push. Returns stdout/stderr for the agent to process."""
     data = request.get_json(silent=True) or {}
-    message = data.get("message", "Auto-commit from VerifyBot")
+    message = data.get("message", "Auto-commit from Agent")
 
     results = []
     # Step 1: git add -A
@@ -1124,7 +1124,7 @@ def _get_html():
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>VerifyBot Workbench</title>
+<title>Agent Workbench</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.min.js"></script>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
@@ -1142,21 +1142,23 @@ html,body{height:100%;overflow:hidden;font-family:'DM Sans',sans-serif;backgroun
 
 /* === TOOLBAR === */
 .toolbar{
-  height:var(--toolbar-h);background:var(--bg2);border-bottom:1px solid var(--brd);
-  display:flex;align-items:center;padding:0 12px;gap:8px;flex-shrink:0;z-index:100;
+  height:auto;min-height:var(--toolbar-h);background:var(--bg2);border-bottom:1px solid var(--brd);
+  display:flex;align-items:center;padding:4px 12px;gap:6px;flex-shrink:0;z-index:100;
+  flex-wrap:wrap;
 }
 .toolbar .logo{
   width:26px;height:26px;background:linear-gradient(135deg,var(--acc),#9b6cff);
   border-radius:7px;display:flex;align-items:center;justify-content:center;
   font-weight:700;font-size:12px;color:#fff;flex-shrink:0;
 }
-.toolbar .title{font-size:14px;font-weight:600;margin-right:12px;letter-spacing:-.3px}
-.toolbar .sep{width:1px;height:20px;background:var(--brd);margin:0 4px}
+.toolbar .title{font-size:14px;font-weight:600;margin-right:8px;letter-spacing:-.3px;white-space:nowrap}
+.toolbar .sep{width:1px;height:20px;background:var(--brd);margin:0 2px;flex-shrink:0}
 
 .tb-btn{
-  padding:5px 12px;background:var(--bg3);border:1px solid var(--brd);border-radius:7px;
+  padding:5px 10px;background:var(--bg3);border:1px solid var(--brd);border-radius:7px;
   color:var(--tx2);font-family:inherit;font-size:12px;font-weight:500;cursor:pointer;
-  display:flex;align-items:center;gap:5px;transition:all .12s;position:relative;
+  display:flex;align-items:center;gap:4px;transition:all .12s;position:relative;
+  white-space:nowrap;flex-shrink:0;
 }
 .tb-btn:hover{background:var(--bg4);color:var(--tx);border-color:var(--brd2)}
 .tb-btn.accent{background:var(--acc2);border-color:var(--acc);color:#fff}
@@ -1164,15 +1166,26 @@ html,body{height:100%;overflow:hidden;font-family:'DM Sans',sans-serif;backgroun
 
 .tb-select{
   padding:4px 8px;background:var(--bg3);border:1px solid var(--brd);border-radius:6px;
-  color:var(--tx);font-family:inherit;font-size:12px;outline:none;
+  color:var(--tx);font-family:inherit;font-size:12px;outline:none;flex-shrink:0;
 }
 .tb-select option{background:var(--bg2)}
 .tb-input{
   width:48px;padding:4px 6px;background:var(--bg3);border:1px solid var(--brd);
   border-radius:6px;color:var(--tx);font-family:inherit;font-size:12px;
-  outline:none;text-align:center;
+  outline:none;text-align:center;flex-shrink:0;
 }
-.tb-label{font-size:11px;color:var(--tx3);font-weight:500}
+.tb-label{font-size:11px;color:var(--tx3);font-weight:500;white-space:nowrap;flex-shrink:0}
+
+/* Hide verbose labels at narrow widths */
+@media (max-width: 900px) {
+  .toolbar .tb-label{display:none}
+  .toolbar .sep{display:none}
+  .toolbar .title{margin-right:4px}
+}
+@media (max-width: 680px) {
+  .toolbar .title{display:none}
+  .toolbar .dropdown-wrap .tb-btn span{display:none}
+}
 
 .status-dot{width:7px;height:7px;border-radius:50%;background:var(--ok);flex-shrink:0}
 .status-dot.busy{background:var(--acc);animation:pulse 1.5s ease-in-out infinite}
@@ -1588,8 +1601,8 @@ html,body{height:100%;overflow:hidden;font-family:'DM Sans',sans-serif;backgroun
 
 <!-- TOOLBAR -->
 <div class="toolbar">
-  <div class="logo">V</div>
-  <span class="title">VerifyBot</span>
+  <div class="logo">A</div>
+  <span class="title">Agent</span>
   <div class="sep"></div>
 
   <div class="dropdown-wrap">
@@ -1652,7 +1665,8 @@ html,body{height:100%;overflow:hidden;font-family:'DM Sans',sans-serif;backgroun
   <div class="modal">
     <div class="modal-header">
       <span id="modalTitle">File</span>
-      <button class="tb-btn" onclick="copyModalContent()" id="modalCopyBtn" style="margin-left:auto;margin-right:8px;font-size:11px;padding:3px 10px">
+      <span style="flex:1"></span>
+      <button class="tb-btn" onclick="copyModalContent()" id="modalCopyBtn" style="font-size:11px;padding:3px 10px;margin-right:6px">
         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-1px;margin-right:3px"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>Copy All
       </button>
       <span class="close" onclick="closeModal()">&times;</span>
@@ -1687,8 +1701,8 @@ html,body{height:100%;overflow:hidden;font-family:'DM Sans',sans-serif;backgroun
       </defs>
     </svg>
     <div class="welcome" id="welcome">
-      <div class="icon">V</div>
-      <h2>VerifyBot Workbench</h2>
+      <div class="icon">A</div>
+      <h2>Agent Workbench</h2>
       <p>Type a prompt below. Each task spawns an agent panel here. Drag headers to reorder, resize from any edge or corner.</p>
       <div class="examples">
         <div class="example-chip" onclick="useExample(this)">write a fizzbuzz script</div>
@@ -2046,7 +2060,7 @@ function closePanel(id) {
   if (Object.keys(agents).length === 0) {
     document.getElementById('canvas').innerHTML =
       '<div class="welcome" id="welcome">' +
-        '<div class="icon">V</div><h2>VerifyBot Workbench</h2>' +
+        '<div class="icon">A</div><h2>Agent Workbench</h2>' +
         '<p>Type a prompt below to spawn an agent.</p>' +
         '<div class="examples">' +
           '<div class="example-chip" onclick="useExample(this)">write a fizzbuzz script</div>' +
@@ -2369,7 +2383,7 @@ function runTests() { socket.emit('run_tests', {}); }
 // === PUSH TO GITHUB ===
 async function pushToGithub() {
   // Quick commit message
-  const msg = prompt('Commit message:', 'Update from VerifyBot');
+  const msg = prompt('Commit message:', 'Update from Agent');
   if (!msg) return;
 
   // First try the simple push
@@ -2397,10 +2411,7 @@ async function pushToGithub() {
 
     // Spawn an agent to fix it
     showToast('Push failed - spawning agent to fix...');
-    const fixPrompt = 'I tried to push to GitHub but it failed. ' +
-      'Diagnose and fix the issue. Run the necessary git commands to resolve it ' +
-      '(pull, merge, rebase, set upstream, etc.) and then push successfully.\n\n' +
-      'Error details:\n' + errorSummary;
+    const fixPrompt = 'Please push my changes to github';
 
     socket.emit('run_agent', {
       prompt: fixPrompt,
@@ -2897,12 +2908,12 @@ function updateGlobalStatus() {
 # ---------------------------------------------------------------------------
 
 def main():
-    port = int(os.environ.get("VERIFYBOT_PORT", 5000))
+    port = int(os.environ.get("AGENT_PORT", 5000))
     host = "127.0.0.1"
 
     print()
     print("=" * 60)
-    print("  VerifyBot Workbench")
+    print("  Agent Workbench")
     print("=" * 60)
     print(f"  URL:  http://{host}:{port}")
     print(f"  Root: {ROOT}")

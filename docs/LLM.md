@@ -24,7 +24,7 @@ Automates the LLM-to-hardware debugging loop: sends prompts to ChatGPT via brows
 ## Directory Structure
 
 ```
-verifybot/
+agent/
 ├── main.py                 # Entry point + full pipeline
 ├── tests.py                # E2E test suite (parallel streams, LLM assertion)
 ├── core/

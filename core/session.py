@@ -224,7 +224,112 @@ class ChatGPTSession:
                         timeout=S.NAVIGATION_TIMEOUT * 1000)
         self._page.wait_for_selector(S.PROMPT_TEXTAREA,
                                      timeout=S.NAVIGATION_TIMEOUT * 1000)
+
+        # If a specific model was requested (not 'auto'), verify via DOM
+        # that the correct model is active. If not, click the picker to
+        # select it. URL params are unreliable -- ChatGPT changes them.
+        if self._model != "auto":
+            self._ensure_model_selected()
+
         print(f"[OK] ChatGPT loaded (model={self._model}), ready for prompt.")
+
+    def _ensure_model_selected(self):
+        """Use the DOM model picker to verify/select the active model.
+
+        ChatGPT's model picker is a dropdown at the top of the page.
+        We check if the current model name appears in the picker button
+        text. If not, we click the picker and select the right model.
+        """
+        page = self._page
+        target = self._model  # 'instant' or 'thinking'
+
+        # What text should appear in the picker button for each model
+        model_labels = {
+            "instant":  ["Instant", "5.3 Instant"],
+            "thinking": ["Thinking", "5.2 Thinking"],
+        }
+        expected_labels = model_labels.get(target, [])
+        if not expected_labels:
+            return
+
+        # Step 1: Check if the picker button already shows the right model
+        time.sleep(1)  # Let UI settle after navigation
+        try:
+            for sel in S.MODEL_PICKER_BUTTON_SELECTORS:
+                btn = page.query_selector(sel)
+                if btn and btn.is_visible():
+                    btn_text = btn.inner_text().strip()
+                    if any(lbl.lower() in btn_text.lower() for lbl in expected_labels):
+                        return  # Already on the correct model
+                    break  # Found the picker button but wrong model -- need to switch
+        except Exception:
+            pass
+
+        # Step 2: Click the model picker to open the dropdown
+        print(f"  [MODEL] Switching to {target} via picker...")
+        picker_btn = None
+        for sel in S.MODEL_PICKER_BUTTON_SELECTORS:
+            try:
+                btn = page.query_selector(sel)
+                if btn and btn.is_visible():
+                    picker_btn = btn
+                    break
+            except Exception:
+                continue
+
+        if not picker_btn:
+            print(f"  [WARN] Could not find model picker button")
+            return
+
+        try:
+            picker_btn.click()
+            time.sleep(0.8)  # Wait for dropdown animation
+        except Exception as e:
+            print(f"  [WARN] Could not click model picker: {e}")
+            return
+
+        # Step 3: Find and click the target model in the dropdown
+        menu_selectors = S.MODEL_MENU_ITEM_SELECTORS.get(target, [])
+        clicked = False
+        for sel in menu_selectors:
+            try:
+                item = page.query_selector(sel)
+                if item and item.is_visible():
+                    item.click()
+                    clicked = True
+                    print(f"  [MODEL] Selected {target} from picker")
+                    time.sleep(1)  # Let UI update
+                    break
+            except Exception:
+                continue
+
+        if not clicked:
+            # Fallback: try clicking by text content directly
+            try:
+                for lbl in expected_labels:
+                    items = page.query_selector_all(f'div[role="menuitem"], div[role="option"]')
+                    for item in items:
+                        try:
+                            if lbl.lower() in item.inner_text().lower() and item.is_visible():
+                                item.click()
+                                clicked = True
+                                print(f"  [MODEL] Selected '{lbl}' from picker (fallback)")
+                                time.sleep(1)
+                                break
+                        except Exception:
+                            continue
+                    if clicked:
+                        break
+            except Exception:
+                pass
+
+        if not clicked:
+            print(f"  [WARN] Could not select {target} model from picker")
+            # Click elsewhere to close dropdown
+            try:
+                page.click(S.PROMPT_TEXTAREA)
+            except Exception:
+                pass
 
     def _send_and_wait(self, text: str) -> str:
         page = self._page
