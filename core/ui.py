@@ -126,6 +126,15 @@ class AgentWriter:
                 except Exception:
                     pass  # give up on console, still send via WS
         if text.strip() and self.sid and self.agent_id:
+            # Filter greenlet/playwright cross-thread noise server-side
+            if any(kw in text for kw in (
+                'greenlet.error', 'Cannot switch to a different thread',
+                '_sync_base.py', 'g_self.switch()', 'Exception in callback SyncBase',
+                'Handle SyncBase', 'asyncio\\events.py', 'asyncio/events.py',
+                'self._context.run(self._callback', 'task.add_done_callback',
+                'suspended active started main', '(otid=',
+            )):
+                return
             socketio.emit("agent_output", {
                 "agent_id": self.agent_id,
                 "stream": self.stream_name,
@@ -263,38 +272,74 @@ def api_clear(folder):
 
 @app.route("/api/agent_files/<agent_id>/<folder>")
 def api_agent_files(agent_id, folder):
-    """List files belonging to a specific agent by matching timestamp/name patterns.
-
-    The agent's raw_md file is stored in _agent_sessions. For programs and outputs,
-    we match files created during the agent's run by timestamp range.
-    """
+    """List files belonging to a specific agent by matching owned files or timestamp."""
     dir_map = {"history": RAW_MD_DIR, "programs": PROGRAMS_DIR, "outputs": OUTPUTS_DIR}
     target = dir_map.get(folder)
     if not target or not target.exists():
         return jsonify([])
 
-    # Get agent session info to find its md_path
+    # Get agent session info
     with _agent_sessions_lock:
         si = _agent_sessions.get(agent_id, {})
     md_path = si.get("md_path")
     start_time = si.get("start_time")
+    owned = si.get("owned_files", set())
 
     files = []
-    if folder == "history" and md_path and md_path.exists():
-        # Just return the agent's own log file
-        try:
-            content = md_path.read_text(encoding="utf-8", errors="replace")
-            prompt_match = re.search(r"\*\*Prompt\*\*:\s*(.+)", content)
-            prompt = prompt_match.group(1) if prompt_match else md_path.stem
-            files.append({
-                "filename": md_path.name,
-                "prompt": prompt[:120],
-                "date": datetime.fromtimestamp(md_path.stat().st_mtime).strftime("%Y-%m-%d %H:%M"),
-            })
-        except Exception:
-            pass
+
+    if owned:
+        # Use precise file ownership tracking (test streams)
+        for f in sorted(target.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
+            if not f.is_file():
+                continue
+            if str(f.resolve()) not in owned:
+                continue
+            if folder == "history":
+                try:
+                    content = f.read_text(encoding="utf-8", errors="replace")
+                    prompt_match = re.search(r"\*\*Prompt\*\*:\s*(.+)", content)
+                    prompt_str = prompt_match.group(1) if prompt_match else f.stem
+                    files.append({
+                        "filename": f.name,
+                        "prompt": prompt_str[:120],
+                        "date": datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M"),
+                    })
+                except Exception:
+                    pass
+            else:
+                files.append({
+                    "name": f.name,
+                    "size": f.stat().st_size,
+                    "modified": datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M"),
+                })
+    elif folder == "history":
+        if start_time:
+            for f in sorted(target.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
+                if f.is_file() and f.suffix == '.md' and f.stat().st_mtime >= start_time:
+                    try:
+                        content = f.read_text(encoding="utf-8", errors="replace")
+                        prompt_match = re.search(r"\*\*Prompt\*\*:\s*(.+)", content)
+                        prompt_str = prompt_match.group(1) if prompt_match else f.stem
+                        files.append({
+                            "filename": f.name,
+                            "prompt": prompt_str[:120],
+                            "date": datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M"),
+                        })
+                    except Exception:
+                        pass
+        elif md_path and md_path.exists():
+            try:
+                content = md_path.read_text(encoding="utf-8", errors="replace")
+                prompt_match = re.search(r"\*\*Prompt\*\*:\s*(.+)", content)
+                prompt_str = prompt_match.group(1) if prompt_match else md_path.stem
+                files.append({
+                    "filename": md_path.name,
+                    "prompt": prompt_str[:120],
+                    "date": datetime.fromtimestamp(md_path.stat().st_mtime).strftime("%Y-%m-%d %H:%M"),
+                })
+            except Exception:
+                pass
     elif start_time and target.exists():
-        # Match files created after agent start time
         for f in sorted(target.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
             if f.is_file() and f.stat().st_mtime >= start_time:
                 files.append({
@@ -892,17 +937,16 @@ def on_run_tests(data):
                             else:
                                 all_passed = False
 
-                            # Update md_path so file buttons can find logs
+                            # Track files created during this test for file buttons
                             try:
-                                latest_md = max(
-                                    (f for f in RAW_MD_DIR.iterdir() if f.is_file() and f.suffix == '.md'),
-                                    key=lambda p: p.stat().st_mtime, default=None
-                                )
-                                if latest_md and latest_md.stat().st_mtime >= test_start:
-                                    with _agent_sessions_lock:
-                                        si = _agent_sessions.get(agent_id)
-                                        if si:
-                                            si["md_path"] = latest_md
+                                for d_ in [RAW_MD_DIR, PROGRAMS_DIR, OUTPUTS_DIR]:
+                                    if d_.exists():
+                                        for f_ in d_.iterdir():
+                                            if f_.is_file() and f_.stat().st_mtime >= test_start:
+                                                with _agent_sessions_lock:
+                                                    si_ = _agent_sessions.get(agent_id)
+                                                    if si_:
+                                                        si_.setdefault("owned_files", set()).add(str(f_.resolve()))
                             except Exception:
                                 pass
 
@@ -1595,18 +1639,27 @@ socket.on('agent_output', d => {
     if (!raw && raw !== '') continue;
     const line = stripAnsi(raw);
 
-    // Filter out greenlet/playwright cross-thread noise
+    // Filter out greenlet/playwright cross-thread noise (comprehensive)
+    const lt = line.trim();
     if (line.includes('greenlet.error') || line.includes('Cannot switch to a different thread') ||
         line.includes('_sync_base.py') || line.includes('g_self.switch()') ||
         line.includes('Exception in callback SyncBase') ||
-        (line.trim().startsWith('Current:') && line.includes('greenlet')) ||
-        (line.trim().startsWith('Expected:') && line.includes('greenlet')) ||
-        (line.trim().startsWith('handle:') && line.includes('Handle SyncBase')) ||
-        (line.trim().startsWith('File "') && line.includes('_sync_base')) ||
-        (line.trim().startsWith('task.add_done_callback')) ||
+        line.includes('Handle SyncBase') ||
+        line.includes('asyncio\\events.py') || line.includes('asyncio/events.py') ||
+        line.includes('self._context.run(') || line.includes('self._callback') ||
+        line.includes('_sync_base.py:') ||
+        line.includes('task.add_done_callback') ||
         line.includes('(otid=') ||
-        (line.trim() === '~~~~~~~~~~~~~^^') ||
-        (line.trim().startsWith('~') && line.trim().endsWith('^^'))
+        line.includes('suspended active started main') ||
+        (lt.startsWith('Current:') && line.includes('greenlet')) ||
+        (lt.startsWith('Expected:') && line.includes('greenlet')) ||
+        (lt.startsWith('~') && lt.endsWith('^^')) ||
+        lt === '*self._args)' || lt.startsWith('*self._args') ||
+        (lt.startsWith('handle:') && line.includes('<Handle')) ||
+        (lt.startsWith('File "') && (line.includes('events.py') || line.includes('_sync_base'))) ||
+        (lt === 'Traceback (most recent call last):' && d.stream === 'stderr') ||
+        (lt.startsWith('line ') && lt.includes(', in _run')) ||
+        (lt.startsWith('line ') && lt.includes(', in <lambda>'))
     ) continue;
 
     const span = document.createElement('span');
@@ -2390,10 +2443,15 @@ function showToast(msg) {
     }
   });
 
-  // Zoom: scroll wheel
+  // Zoom: scroll wheel (no Ctrl needed, but only on empty canvas area)
   wb.addEventListener('wheel', e => {
-    // Only zoom if Ctrl is held or on empty area
-    if (!e.ctrlKey) return;
+    // If scrolling inside a panel (terminal, browser, etc.), let it scroll normally
+    const target = e.target;
+    if (target.closest('.agent-terminal') || target.closest('.agent-browser') ||
+        target.closest('.panel-input-bar') || target.closest('.dropdown-panel') ||
+        target.closest('.modal-body') || target.closest('.confirm-box')) return;
+    // Only zoom on workbench/canvas background
+    if (target !== wb && target !== canvas && !target.classList.contains('welcome')) return;
     e.preventDefault();
     const rect = wb.getBoundingClientRect();
     const mx = e.clientX - rect.left;
