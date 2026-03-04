@@ -1494,6 +1494,49 @@ html,body{height:100%;overflow:hidden;font-family:'DM Sans',sans-serif;backgroun
 ::-webkit-scrollbar-track{background:transparent}
 ::-webkit-scrollbar-thumb{background:var(--brd);border-radius:3px}
 ::-webkit-scrollbar-thumb:hover{background:var(--tx3)}
+
+/* === ESCALATION SVG OVERLAY === */
+.escalation-svg{
+  position:absolute;top:0;left:0;width:100%;height:100%;
+  pointer-events:none;z-index:4;overflow:visible;
+}
+.escalation-line{
+  fill:none;stroke:url(#escGrad);stroke-width:2;
+  stroke-linecap:round;opacity:.7;
+  filter:drop-shadow(0 0 6px rgba(168,130,255,.4));
+}
+.escalation-line.animating{
+  stroke-dasharray:8 4;
+  animation:escDash 1.2s linear infinite;
+}
+@keyframes escDash{to{stroke-dashoffset:-24}}
+
+.escalation-dot{
+  fill:#a882ff;filter:drop-shadow(0 0 4px rgba(168,130,255,.6));
+}
+.escalation-label{
+  fill:var(--tx3);font-family:'DM Sans',sans-serif;font-size:9px;
+  font-weight:500;letter-spacing:.3px;
+}
+
+/* Escalation panel has a subtle purple tint */
+.agent-panel.escalation-panel{
+  border-color:rgba(168,130,255,.35);
+  box-shadow:0 0 20px rgba(168,130,255,.08);
+}
+.agent-panel.escalation-panel .agent-head{
+  background:linear-gradient(135deg,rgba(168,130,255,.12),var(--bg3));
+  border-bottom-color:rgba(168,130,255,.25);
+}
+.agent-panel.escalation-panel .dot.run{
+  background:#a882ff;
+}
+.escalation-badge{
+  font-size:9px;font-weight:600;color:#a882ff;
+  background:rgba(168,130,255,.12);border:1px solid rgba(168,130,255,.25);
+  padding:1px 6px;border-radius:4px;margin-right:4px;
+  letter-spacing:.3px;text-transform:uppercase;flex-shrink:0;
+}
 </style>
 </head>
 <body>
@@ -1584,6 +1627,17 @@ html,body{height:100%;overflow:hidden;font-family:'DM Sans',sans-serif;backgroun
 <!-- WORKBENCH -->
 <div class="workbench" id="workbench">
   <div class="canvas" id="canvas">
+    <!-- SVG overlay for escalation connection lines -->
+    <svg class="escalation-svg" id="escalationSvg">
+      <defs>
+        <linearGradient id="escGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+          <stop offset="0%" stop-color="rgba(168,130,255,.15)"/>
+          <stop offset="30%" stop-color="rgba(168,130,255,.55)"/>
+          <stop offset="70%" stop-color="rgba(168,130,255,.55)"/>
+          <stop offset="100%" stop-color="rgba(168,130,255,.15)"/>
+        </linearGradient>
+      </defs>
+    </svg>
     <div class="welcome" id="welcome">
       <div class="icon">V</div>
       <h2>VerifyBot Workbench</h2>
@@ -1629,7 +1683,14 @@ socket.on('agent_created', d => {
 });
 
 socket.on('agent_output', d => {
-  const a = agents[d.agent_id];
+  // Check if this agent is in escalation mode and redirect output
+  let targetAgentId = d.agent_id;
+  const parentAgent = agents[d.agent_id];
+  if (parentAgent && parentAgent._escalatingTo && agents[parentAgent._escalatingTo]) {
+    targetAgentId = parentAgent._escalatingTo;
+  }
+
+  const a = agents[targetAgentId];
   if (!a) return;
   const term = a.terminal;
 
@@ -1723,6 +1784,25 @@ function stripAnsi(s) {
 socket.on('agent_done', d => {
   const a = agents[d.agent_id];
   if (!a) return;
+
+  // Check if this is the end of an escalation
+  if (a._escalatingTo) {
+    const childId = a._escalatingTo;
+    // Finalize the child panel
+    const child = agents[childId];
+    if (child) {
+      child.dot.className = 'dot ' + (d.success ? 'pass' : 'fail');
+      child.status.className = 'agent-status ' + (d.success ? 'pass' : 'fail');
+      child.status.innerHTML = (d.success ? 'PASS (Thinking)' : 'FAIL (Thinking)') +
+        ' <button class="copy-output-btn" onclick="copyTerminal(\'' + childId + '\')" title="Copy output">' +
+        '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">' +
+        '<rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/>' +
+        '</svg></button>';
+    }
+    finalizeEscalationLine(childId);
+    delete a._escalatingTo;
+  }
+
   const ok = d.success;
   a.dot.className = 'dot ' + (ok ? 'pass' : 'fail');
   a.status.className = 'agent-status ' + (ok ? 'pass' : 'fail');
@@ -1855,7 +1935,13 @@ function createPanel(id, prompt, isTest) {
 
 // Live screenshots pushed from the pipeline thread
 socket.on('agent_screenshot', d => {
-  const a = agents[d.agent_id];
+  // Route to escalation panel if active
+  let targetId = d.agent_id;
+  const parent = agents[d.agent_id];
+  if (parent && parent._escalatingTo && agents[parent._escalatingTo]) {
+    targetId = parent._escalatingTo;
+  }
+  const a = agents[targetId];
   if (!a || !d.image) return;
   a.browserImg.src = 'data:image/png;base64,' + d.image;
   a.browserImg.style.display = 'block';
@@ -1884,6 +1970,29 @@ function closePanel(id) {
   if (a) {
     a.el.remove();
     socket.emit('close_agent', { agent_id: id });
+    // Clean up escalation links
+    if (escalationLinks[id]) {
+      const linkId = 'esc-line-' + id.replace(/[^a-z0-9]/gi, '_');
+      ['', '-dot1', '-dot2', '-label'].forEach(s => {
+        const el = document.getElementById(linkId + s);
+        if (el) el.remove();
+      });
+      // Clear parent's redirect
+      const parent = agents[escalationLinks[id].parentId];
+      if (parent) delete parent._escalatingTo;
+      delete escalationLinks[id];
+    }
+    // Also check if this is a parent with an escalation child
+    for (const [childId, link] of Object.entries(escalationLinks)) {
+      if (link.parentId === id) {
+        const linkId = 'esc-line-' + childId.replace(/[^a-z0-9]/gi, '_');
+        ['', '-dot1', '-dot2', '-label'].forEach(s => {
+          const el = document.getElementById(linkId + s);
+          if (el) el.remove();
+        });
+        delete escalationLinks[childId];
+      }
+    }
   }
   delete agents[id];
   if (Object.keys(agents).length === 0) {
@@ -1920,6 +2029,7 @@ function makeDraggable(panel, handle) {
     if (Math.abs(dx) > 3 || Math.abs(dy) > 3) moved = true;
     panel.style.left = (ox + dx) + 'px';
     panel.style.top = (oy + dy) + 'px';
+    redrawAllEscalationLines();
   });
   document.addEventListener('mouseup', () => {
     if (!dragging) return;
@@ -1965,6 +2075,7 @@ function makeResizable(panel) {
         if (!isMin) panel.style.height = newH + 'px';
         panel.style.left = newL + 'px';
         panel.style.top = newT + 'px';
+        redrawAllEscalationLines();
       };
       const onUp = () => {
         document.removeEventListener('mousemove', onMove);
@@ -2477,6 +2588,164 @@ function showToast(msg) {
   // Expose for panel creation positioning
   window._canvas = { getPan: () => ({x: panX, y: panY, s: scale}) };
 })();
+
+// === ESCALATION SYSTEM ===
+// Tracks parent -> escalation panel links and draws curved SVG lines
+let escalationLinks = {};  // escalation_agent_id -> { parentId, childId }
+let activeEscalation = null;  // agent_id currently escalating
+
+// Listen for escalation marker in agent output
+socket.on('agent_output', function handleEscalationDetect(d) {
+  // Detect escalation start marker printed by _escalate_to_thinking
+  const text = d.text || '';
+  if (text.includes('MODEL ESCALATION')) {
+    activeEscalation = d.agent_id;
+  }
+  // When we see the Thinking model session load, spawn the child panel
+  if (activeEscalation === d.agent_id && text.includes('ChatGPT loaded (model=thinking)')) {
+    spawnEscalationPanel(d.agent_id);
+    activeEscalation = null;
+  }
+});
+
+function spawnEscalationPanel(parentId) {
+  const parent = agents[parentId];
+  if (!parent) return;
+  const childId = parentId + '-escalation';
+  if (agents[childId]) return;  // already exists
+
+  // Create the escalation panel
+  createPanel(childId, 'Thinking (escalation)', false);
+  const child = agents[childId];
+  if (!child) return;
+
+  // Style it as escalation panel
+  child.el.classList.add('escalation-panel');
+
+  // Add the "THINKING" badge to the header
+  const label = child.el.querySelector('.agent-head .label');
+  if (label) {
+    const badge = document.createElement('span');
+    badge.className = 'escalation-badge';
+    badge.textContent = 'Thinking';
+    label.parentNode.insertBefore(badge, label);
+    label.textContent = 'Escalation for: ' + (parent.el.querySelector('.label')?.textContent || parentId).slice(0, 50);
+  }
+
+  // Position it to the right of the parent panel
+  const parentLeft = parseInt(parent.el.style.left) || 0;
+  const parentTop = parseInt(parent.el.style.top) || 0;
+  const parentW = parent.el.offsetWidth || 680;
+  child.el.style.left = (parentLeft + parentW + 80) + 'px';
+  child.el.style.top = (parentTop + 40) + 'px';
+
+  // Track the link
+  escalationLinks[childId] = { parentId, childId };
+
+  // Draw the initial line
+  drawEscalationLine(parentId, childId);
+
+  // Redirect escalation output from parent terminal to child terminal
+  redirectEscalationOutput(parentId, childId);
+}
+
+function redirectEscalationOutput(parentId, childId) {
+  // After escalation panel spawns, intercept agent_output for the parent
+  // and route escalation-phase lines to the child panel instead.
+  // We do this by marking the parent as "in escalation mode"
+  const parent = agents[parentId];
+  if (parent) {
+    parent._escalatingTo = childId;
+  }
+}
+
+// Draw a curved bezier line from parent panel's right edge to child panel's left edge
+function drawEscalationLine(parentId, childId) {
+  const svg = document.getElementById('escalationSvg');
+  if (!svg) return;
+  const parent = agents[parentId];
+  const child = agents[childId];
+  if (!parent || !child) return;
+
+  // Remove existing line for this link
+  const existingId = 'esc-line-' + childId.replace(/[^a-z0-9]/gi, '_');
+  const existing = document.getElementById(existingId);
+  if (existing) existing.remove();
+  const existingDot1 = document.getElementById(existingId + '-dot1');
+  if (existingDot1) existingDot1.remove();
+  const existingDot2 = document.getElementById(existingId + '-dot2');
+  if (existingDot2) existingDot2.remove();
+  const existingLbl = document.getElementById(existingId + '-label');
+  if (existingLbl) existingLbl.remove();
+
+  // Get positions (in canvas coordinates)
+  const pL = parseInt(parent.el.style.left) || 0;
+  const pT = parseInt(parent.el.style.top) || 0;
+  const pW = parent.el.offsetWidth || 680;
+  const pH = parent.el.offsetHeight || 420;
+  const cL = parseInt(child.el.style.left) || 0;
+  const cT = parseInt(child.el.style.top) || 0;
+  const cH = child.el.offsetHeight || 420;
+
+  // Start: right-center of parent
+  const x1 = pL + pW;
+  const y1 = pT + pH / 2;
+  // End: left-center of child
+  const x2 = cL;
+  const y2 = cT + cH / 2;
+
+  // Control points for a smooth S-curve
+  const dx = Math.abs(x2 - x1);
+  const cpOffset = Math.max(60, dx * 0.4);
+  const cp1x = x1 + cpOffset;
+  const cp1y = y1;
+  const cp2x = x2 - cpOffset;
+  const cp2y = y2;
+
+  const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  path.id = existingId;
+  path.setAttribute('d', 'M' + x1 + ',' + y1 + ' C' + cp1x + ',' + cp1y + ' ' + cp2x + ',' + cp2y + ' ' + x2 + ',' + y2);
+  path.setAttribute('class', 'escalation-line animating');
+  svg.appendChild(path);
+
+  // Dots at connection points
+  const dot1 = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+  dot1.id = existingId + '-dot1';
+  dot1.setAttribute('cx', x1); dot1.setAttribute('cy', y1);
+  dot1.setAttribute('r', '3'); dot1.setAttribute('class', 'escalation-dot');
+  svg.appendChild(dot1);
+
+  const dot2 = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+  dot2.id = existingId + '-dot2';
+  dot2.setAttribute('cx', x2); dot2.setAttribute('cy', y2);
+  dot2.setAttribute('r', '3'); dot2.setAttribute('class', 'escalation-dot');
+  svg.appendChild(dot2);
+
+  // Label at midpoint
+  const mx = (x1 + x2) / 2;
+  const my = (y1 + y2) / 2 - 8;
+  const lbl = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+  lbl.id = existingId + '-label';
+  lbl.setAttribute('x', mx); lbl.setAttribute('y', my);
+  lbl.setAttribute('text-anchor', 'middle');
+  lbl.setAttribute('class', 'escalation-label');
+  lbl.textContent = 'context handoff';
+  svg.appendChild(lbl);
+}
+
+// Redraw all escalation lines (called on drag/resize)
+function redrawAllEscalationLines() {
+  for (const link of Object.values(escalationLinks)) {
+    drawEscalationLine(link.parentId, link.childId);
+  }
+}
+
+// Stop animating the line when escalation finishes
+function finalizeEscalationLine(childId) {
+  const existingId = 'esc-line-' + childId.replace(/[^a-z0-9]/gi, '_');
+  const path = document.getElementById(existingId);
+  if (path) path.classList.remove('animating');
+}
 
 function updateGlobalStatus() {
   const dot = document.getElementById('statusDot');
