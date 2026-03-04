@@ -5,6 +5,7 @@ core/.setup_complete
 raw_md/
 programs/
 outputs/
+uploads/
 context/
 __pycache__/
 *.pyc

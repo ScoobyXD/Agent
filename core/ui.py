@@ -608,6 +608,15 @@ def on_run_agent(data):
                     session.__exit__(None, None, None)
                 except Exception:
                     pass
+            # Clean up the cloned browser profile
+            agent_profile = ROOT / ".browser_profiles" / agent_id
+            if agent_profile.exists():
+                try:
+                    import shutil as _shutil2
+                    _shutil2.rmtree(str(agent_profile), ignore_errors=True)
+                    print(f"  [CLEANUP] Removed .browser_profiles/{agent_id}/")
+                except Exception:
+                    pass
             with _agent_sessions_lock:
                 _agent_sessions.pop(agent_id, None)
             sys.stdout = old_out
@@ -664,41 +673,226 @@ def on_close_agent(data):
 
 @socketio.on("run_tests")
 def on_run_tests(data):
-    """Run tests.py as a subprocess and stream output."""
+    """Run tests using the agent panel system.
+
+    Each test stream gets its own agent panel with live terminal output
+    and browser screenshots, just like a regular agent run. This avoids
+    the orphaned browser windows and missing terminal output issues.
+    """
     global _agent_counter
-    with _agents_lock:
-        _agent_counter += 1
-        agent_id = f"test-{_agent_counter}"
 
     sid = request.sid
-    emit("agent_created", {"agent_id": agent_id, "prompt": "Test Suite", "is_test": True})
 
-    def run():
+    def run_test_streams():
         try:
-            proc = subprocess.Popen(
-                [sys.executable, str(ROOT / "tests.py")],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, cwd=str(ROOT),
-                encoding="utf-8", errors="replace",
-            )
-            for line in proc.stdout:
-                socketio.emit("agent_output", {
-                    "agent_id": agent_id, "stream": "stdout", "text": line,
-                }, to=sid)
-            proc.wait()
-            socketio.emit("agent_done", {
-                "agent_id": agent_id, "success": proc.returncode == 0,
-            }, to=sid)
-        except Exception as e:
-            socketio.emit("agent_error", {"agent_id": agent_id, "error": str(e)}, to=sid)
-        finally:
-            with _agents_lock:
-                _agents.pop(agent_id, None)
+            # Import test definitions
+            sys.path.insert(0, str(ROOT))
+            from tests import TESTS, clone_profile, cleanup_cloned_profiles
+            from tests import init_test_md, write_test_result, write_summary, append_test_md
+            from main import run_pipeline
+            from core.session import ChatGPTSession
 
-    t = threading.Thread(target=run, daemon=True, name=agent_id)
-    with _agents_lock:
-        _agents[agent_id] = t
-    t.start()
+            init_test_md()
+
+            # Group tests by stream
+            streams = {}
+            for i, test in enumerate(TESTS, 1):
+                s = test.get("stream", str(i))
+                streams.setdefault(s, []).append((i, test))
+
+            results = []
+            results_lock = threading.Lock()
+            passed_tests = set()
+            passed_lock = threading.Lock()
+            stream_threads = []
+            stream_ids = list(streams.keys())
+
+            for stream_id, stream_tests in streams.items():
+                # Create an agent panel for this stream
+                with _agents_lock:
+                    _agent_counter += 1
+                    agent_id = f"test-{stream_id}-{_agent_counter}"
+
+                test_names = ", ".join(t["name"] for _, t in stream_tests)
+                socketio.emit("agent_created", {
+                    "agent_id": agent_id,
+                    "prompt": f"Tests Stream {stream_id}: {test_names}",
+                    "is_test": True,
+                }, to=sid)
+
+                def run_stream_agent(agent_id=agent_id, stream_id=stream_id,
+                                     stream_tests=stream_tests):
+                    """Run a test stream inside an agent panel."""
+                    _out.agent_id = agent_id
+                    _out.sid = sid
+                    _err.agent_id = agent_id
+                    _err.sid = sid
+                    old_out, old_err = sys.stdout, sys.stderr
+                    sys.stdout = _out
+                    sys.stderr = _err
+
+                    session = None
+                    agent_start_time = time.time()
+
+                    try:
+                        # Clone browser profile for this stream
+                        profile_dir = clone_profile(stream_id)
+                        headed = True
+
+                        # Create session
+                        session = ChatGPTSession(headed=headed, profile_dir=profile_dir)
+                        session.__enter__()
+
+                        agent_queue = queue.Queue()
+                        with _agent_sessions_lock:
+                            _agent_sessions[agent_id] = {
+                                "session": session,
+                                "sid": sid,
+                                "queue": agent_queue,
+                                "md_path": None,
+                                "target": "local",
+                                "timeout": 30,
+                                "max_retries": 3,
+                                "start_time": agent_start_time,
+                            }
+
+                        # Monkeypatch screenshots
+                        _orig_wait = ChatGPTSession._wait_for_response
+                        def _patched_wait(self, *args, **kwargs):
+                            resp = _orig_wait(self, *args, **kwargs)
+                            try:
+                                img = session.screenshot()
+                                if img:
+                                    import base64
+                                    socketio.emit("agent_screenshot", {
+                                        "agent_id": agent_id,
+                                        "image": base64.b64encode(img).decode(),
+                                    }, to=sid)
+                            except Exception:
+                                pass
+                            return resp
+                        ChatGPTSession._wait_for_response = _patched_wait
+
+                        # Run each test in this stream
+                        all_passed = True
+                        for num, test in stream_tests:
+                            target = test.get("target", "local")
+                            prompt = test["prompt"]
+
+                            # Check dependency
+                            dep = test.get("depends_on")
+                            if dep is not None:
+                                with passed_lock:
+                                    dep_passed = dep in passed_tests
+                                if not dep_passed:
+                                    print(f"\n[SKIP] Test {num}: {test['name']} (depends on #{dep})")
+                                    with results_lock:
+                                        results.append({
+                                            "num": num, "name": test["name"],
+                                            "stream": stream_id,
+                                            "passed": False, "skipped": True, "elapsed": 0,
+                                        })
+                                    write_test_result(num, test, False, 0, skipped=True)
+                                    continue
+
+                            print(f"\n{'='*50}")
+                            print(f"[TEST {num}] {test['name']}")
+                            print(f"{'='*50}")
+
+                            test_start = time.time()
+                            try:
+                                passed = run_pipeline(
+                                    prompt=prompt,
+                                    target=target,
+                                    max_retries=3,
+                                    timeout=30,
+                                    headed=headed,
+                                    session=session,
+                                )
+                            except Exception as e:
+                                print(f"\n[CRASH] Test {num}: {e}")
+                                passed = False
+
+                            elapsed = time.time() - test_start
+                            if passed:
+                                with passed_lock:
+                                    passed_tests.add(num)
+                            else:
+                                all_passed = False
+
+                            status = "PASS" if passed else "FAIL"
+                            print(f"\n[{status}] Test {num}: {test['name']} ({elapsed:.1f}s)")
+
+                            with results_lock:
+                                results.append({
+                                    "num": num, "name": test["name"],
+                                    "stream": stream_id,
+                                    "passed": passed, "elapsed": elapsed,
+                                })
+                            write_test_result(num, test, passed, elapsed)
+
+                        socketio.emit("agent_done", {
+                            "agent_id": agent_id,
+                            "success": all_passed,
+                        }, to=sid)
+
+                        ChatGPTSession._wait_for_response = _orig_wait
+
+                    except Exception as e:
+                        socketio.emit("agent_error", {
+                            "agent_id": agent_id, "error": str(e),
+                        }, to=sid)
+                    finally:
+                        if session:
+                            try:
+                                session.__exit__(None, None, None)
+                            except Exception:
+                                pass
+                        with _agent_sessions_lock:
+                            _agent_sessions.pop(agent_id, None)
+                        sys.stdout = old_out
+                        sys.stderr = old_err
+                        _out.agent_id = None
+                        _err.agent_id = None
+                        with _agents_lock:
+                            _agents.pop(agent_id, None)
+
+                t = threading.Thread(target=run_stream_agent, daemon=True, name=agent_id)
+                with _agents_lock:
+                    _agents[agent_id] = t
+                stream_threads.append(t)
+                t.start()
+
+            # Wait for all streams to finish
+            for t in stream_threads:
+                t.join()
+
+            # Cleanup cloned profiles
+            cleanup_cloned_profiles(stream_ids)
+
+            # Also clean any .browser_profiles/ dirs
+            profiles_dir = ROOT / ".browser_profiles"
+            if profiles_dir.exists():
+                import shutil as _shutil3
+                _shutil3.rmtree(str(profiles_dir), ignore_errors=True)
+
+            # Write summary
+            total = len(results)
+            passed_ct = sum(1 for r in results if r.get("passed"))
+            failed_ct = total - passed_ct
+            print(f"\n{'='*50}")
+            print(f"TEST SUMMARY: {passed_ct}/{total} passed, {failed_ct} failed")
+            print(f"{'='*50}")
+
+            write_summary(results)
+
+        except Exception as e:
+            socketio.emit("agent_error", {
+                "agent_id": "test-summary",
+                "error": f"Test runner error: {e}",
+            }, to=sid)
+
+    threading.Thread(target=run_test_streams, daemon=True, name="test-coordinator").start()
 
 # ---------------------------------------------------------------------------
 # HTML
@@ -861,13 +1055,7 @@ html,body{height:100%;overflow:hidden;font-family:'DM Sans',sans-serif;backgroun
 .agent-panel.minimized .agent-body,
 .agent-panel.minimized .agent-status,
 .agent-panel.minimized .panel-input-bar{display:none}
-.agent-panel.minimized .resize-handle.rh-n,
-.agent-panel.minimized .resize-handle.rh-s,
-.agent-panel.minimized .resize-handle.rh-ne,
-.agent-panel.minimized .resize-handle.rh-nw,
-.agent-panel.minimized .resize-handle.rh-se,
-.agent-panel.minimized .resize-handle.rh-sw{display:none}
-.agent-panel.minimized{height:34px!important;min-height:34px!important;overflow:hidden;min-width:160px}
+.agent-panel.minimized{height:34px!important;min-height:34px!important;overflow:visible;min-width:160px}
 
 /* Resize handles on all edges and corners */
 .resize-handle{position:absolute;z-index:5}
@@ -896,8 +1084,11 @@ html,body{height:100%;overflow:hidden;font-family:'DM Sans',sans-serif;backgroun
   padding:2px 5px;border-radius:4px;display:flex;align-items:center;
 }
 .agent-head .head-btn:hover{background:var(--bg);color:var(--tx)}
-.agent-head .file-btn{opacity:.5;padding:2px 3px}
+.agent-head .file-btn{opacity:.6;padding:2px 3px}
 .agent-head .file-btn:hover{opacity:1;background:var(--bg3)}
+.agent-head .file-btn.fb-history{color:#f59e0b}
+.agent-head .file-btn.fb-programs{color:#8b5cf6}
+.agent-head .file-btn.fb-outputs{color:#22d3ee}
 .agent-head .head-sep{width:1px;height:14px;background:var(--brd);margin:0 2px;flex-shrink:0}
 
 .agent-body{flex:1;display:flex;overflow:hidden}
@@ -1192,8 +1383,8 @@ html,body{height:100%;overflow:hidden;font-family:'DM Sans',sans-serif;backgroun
   <div class="confirm-box">
     <div class="confirm-msg" id="confirmMsg">Are you sure?</div>
     <div class="confirm-btns">
-      <button class="btn-cancel" onclick="confirmCancel()">Cancel</button>
       <button class="btn-confirm" id="confirmOk" onclick="confirmOk()">Delete</button>
+      <button class="btn-cancel" onclick="confirmCancel()">Cancel</button>
     </div>
   </div>
 </div>
@@ -1353,18 +1544,16 @@ function createPanel(id, prompt, isTest) {
     '<div class="agent-head">' +
       '<div class="dot run"></div>' +
       '<span class="label" title="' + safePrompt + '">' + shortPrompt + '</span>' +
-      '<button class="head-btn file-btn" onclick="event.stopPropagation();openAgentFile(\'' + id + '\',\'history\')" title="View log">' +
+      '<button class="head-btn file-btn fb-history" onclick="event.stopPropagation();openAgentFile(\'' + id + '\',\'history\')" title="View log">' +
         '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>' +
       '</button>' +
-      '<button class="head-btn file-btn" onclick="event.stopPropagation();openAgentFile(\'' + id + '\',\'programs\')" title="View program">' +
+      '<button class="head-btn file-btn fb-programs" onclick="event.stopPropagation();openAgentFile(\'' + id + '\',\'programs\')" title="View program">' +
         '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>' +
       '</button>' +
-      '<button class="head-btn file-btn" onclick="event.stopPropagation();openAgentFile(\'' + id + '\',\'outputs\')" title="View output">' +
+      '<button class="head-btn file-btn fb-outputs" onclick="event.stopPropagation();openAgentFile(\'' + id + '\',\'outputs\')" title="View output">' +
         '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>' +
       '</button>' +
       '<div class="head-sep"></div>' +
-      '<button class="head-btn" onclick="toggleMin(\'' + id + '\')" title="Minimize">&#9644;</button>' +
-      '<button class="head-btn" onclick="toggleMax(\'' + id + '\')" title="Maximize">&#9634;</button>' +
       '<button class="head-btn" onclick="closePanel(\'' + id + '\')" title="Close">&times;</button>' +
     '</div>' +
     // Drop overlay for file drag
