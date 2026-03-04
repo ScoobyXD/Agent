@@ -2,264 +2,122 @@
 
 ## What This Is
 
-A Python tool that automates the copy-paste debugging cycle between an LLM (ChatGPT) and real hardware (Raspberry Pi 5, local machine). Instead of you manually copying terminal errors, pasting them into ChatGPT, copying the fix, and running it -- VerifyBot does the whole loop automatically.
+Automates the LLM-to-hardware debugging loop: sends prompts to ChatGPT via browser automation, extracts code, executes on local machine or Raspberry Pi over SSH, feeds stdout/stderr back for retry. The LLM is the brain; Agent is just hands on the keyboard.
 
-The LLM is the brain. VerifyBot is just hands on the keyboard.
+## Quick Start
 
-## How To Use (New User Guide)
+1. Python 3.10+, a ChatGPT account (browser-based, no API key needed), and optionally a Raspberry Pi.
+2. Run `python main.py "hello"` -- first run triggers a setup wizard (deps, Chromium, Pi SSH creds, ChatGPT login, directories).
+3. After setup: `python main.py "write a fizzbuzz"` or `python main.py "blink LED" --target raspi`.
+4. Re-login: `python main.py --login`. Re-setup: delete `core/.setup_complete`. Tests: `python tests.py`.
+5. Dotfiles lose leading dots when downloaded from Claude.ai -- rename `gitignore` to `.gitignore`, `env` to `.env`.
 
-### Quick Start
+## Pipeline
 
-1. **Get the code**: Download or clone the VerifyBot folder onto your computer.
-
-2. **Make sure you have Python 3.10+**: Open a terminal and run `python --version`. If you don't have Python, install it from https://python.org.
-
-3. **Run it**: Open a terminal in the VerifyBot folder and type:
-   ```bash
-   python main.py "hello"
-   ```
-   On your very first run, a setup wizard will automatically walk you through everything:
-   - Installing dependencies (playwright, paramiko)
-   - Installing the Chromium browser that VerifyBot uses
-   - Setting up Raspberry Pi SSH credentials (optional -- skip if you don't have one)
-   - Logging into ChatGPT through a browser window (your session gets saved)
-   - Creating all the folders VerifyBot needs
-
-4. **That's it.** After setup finishes, you can start using VerifyBot normally:
-   ```bash
-   python main.py "write a script that prints the first 20 prime numbers"
-   python main.py "make a random word generator" --target raspi
-   python main.py "create a file called notes.txt with my grocery list"
-   ```
-
-### What You Need
-
-- **Python 3.10+** (with pip)
-- **A ChatGPT account** (free or paid -- you log in through the browser)
-- **A Raspberry Pi** (optional -- only needed if you want to deploy code to it over SSH)
-
-### What You Do NOT Need
-
-- You do NOT need a `.browser_profile/` folder from someone else. The setup wizard creates your own.
-- You do NOT need an OpenAI API key. VerifyBot uses the free ChatGPT browser interface, not the API.
-- You do NOT need to install anything manually. The setup wizard handles pip packages, Playwright, and Chromium.
-
-### After Setup
-
-- **Run again anytime**: `python main.py "your task here"`
-- **Run test suite**: `python tests.py` (parallel by default, or `python tests.py --sequential` for debug)
-- **Run single test**: `python tests.py --test 1`
-- **Re-login to ChatGPT**: `python main.py --login`
-- **Re-run setup**: Delete `core/.setup_complete`, then run any command.
-- **Add a Raspberry Pi later**: Edit `.env` and fill in `PI_USER`, `PI_HOST`, `PI_PASSWORD`.
-
-### Renaming Dotfiles After Download
-
-If you downloaded files from Claude.ai, some dotfiles lose their leading dot:
-- Rename `gitignore` to `.gitignore`
-- Rename `env` to `.env` (or let the setup wizard create it for you)
-
----
-
-## How It Works
-
-```
-python main.py "make a random word generator that saves to a text file"
-```
-
-1. **Probe**: SSH into Pi, run diagnostic commands (uname, python version, pip list, ls, etc.), save as `context/raspi.md`
-2. **Prompt**: Inject system context + user prompt into ChatGPT via browser automation
-3. **Extract**: Parse response for ```python and ```bash code blocks
-4. **Execute**: Upload scripts to Pi via SFTP and run via SSH, or run bash commands directly
-5. **Verify**: Check exit codes and output
-6. **Retry**: If failed, send raw stdout/stderr back to ChatGPT in the same conversation. Loop until success or max retries.
+1. **Probe** target (SSH diagnostics or local context) -> `context/raspi.md` or `context/local.md`
+2. **Prompt** ChatGPT with system context + user task via Playwright browser automation
+3. **Extract** fenced code blocks (```python, ```bash) from response using regex + DOM parsing
+4. **Execute** scripts on target (SFTP upload + SSH for Pi, subprocess for local)
+5. **Verify** by sending stdout/stderr back to ChatGPT; LLM decides PASS/FAIL/REVISE
+6. **Retry** in same conversation until success or max retries hit
 
 ## Directory Structure
 
 ```
 verifybot/
-├── main.py                    # Entry point -- the entire pipeline
-├── tests.py              # End-to-end test suite (runs prompts through full pipeline)
+├── main.py                 # Entry point + full pipeline
+├── tests.py                # E2E test suite (parallel streams, LLM assertion)
 ├── core/
-│   ├── __init__.py            # Package marker
-│   ├── selectors.py           # ChatGPT DOM selectors (update when frontend changes)
-│   ├── session.py             # Persistent browser session (prompt, followup, new_chat)
-│   ├── setup.py               # First-time setup wizard (runs once automatically)
-│   ├── artifact_sweep.py      # Post-execution cleanup (moves output files to outputs/)
-│   └── .setup_complete        # Marker file -- exists after first-time setup (gitignored)
+│   ├── selectors.py        # ChatGPT DOM selectors (update when UI changes)
+│   ├── session.py          # Persistent browser session (prompt/followup/new_chat)
+│   ├── setup.py            # First-time setup wizard
+│   ├── ui.py               # Flask+SocketIO workbench UI (multi-agent panels)
+│   ├── artifact_sweep.py   # Post-execution cleanup (moves outputs to outputs/)
+│   └── .setup_complete     # Marker file (gitignored)
 ├── skills/
-│   ├── __init__.py            # Package marker
-│   ├── chatgpt_skill.py       # Browser automation wrapper, raw_md saving, login mode
-│   ├── ssh_skill.py           # SSH/SFTP to Raspberry Pi via paramiko
-│   └── extract_skill.py       # Code block extraction and classification from LLM responses
-├── context/                   # Auto-generated system context (live Pi/local snapshots)
-│   ├── raspi.md               # Generated by probe_pi() at pipeline start
-│   └── local.md               # Generated by probe_local() at pipeline start
-├── programs/                  # Extracted scripts — versioned, never overwritten
-│   ├── prime_gen_1.py         # Attempt 1
-│   ├── prime_gen_2.py         # Attempt 2 (fixed version)
-│   └── ...
-├── outputs/                   # Execution outputs — versioned, never overwritten
-│   ├── prime_gen_1.txt        # stdout/stderr from attempt 1
-│   ├── prime_gen_2.txt        # stdout/stderr from attempt 2
-│   └── ...
-├── raw_md/                    # Pipeline run transcripts (timestamped logs)
-│   └── test.md                # Test results record (generated by tests.py)
-├── .env                       # Pi SSH credentials (PI_USER, PI_HOST, PI_PASSWORD)
-├── .browser_profile/          # Chromium cookies (persistent ChatGPT login)
-├── .browser_profile_*/        # Cloned profiles for parallel test agents (auto-cleaned)
-├── .gitignore
-└── LLM.md                     # This file
+│   ├── chatgpt_skill.py    # Browser wrapper, raw_md saving, login mode
+│   ├── ssh_skill.py        # SSH/SFTP to Pi via paramiko
+│   └── extract_skill.py    # Code block extraction + classification
+├── context/                # Auto-generated target snapshots
+├── programs/               # Extracted scripts (versioned: slug_1.py, slug_2.py)
+├── outputs/                # Execution results (versioned: slug_1.txt, slug_2.txt)
+├── uploads/                # User-uploaded files for agent context
+├── raw_md/                 # Full pipeline transcripts (timestamped .md logs)
+├── .env                    # Pi SSH creds (PI_USER, PI_HOST, PI_PASSWORD)
+├── .browser_profile/       # Chromium cookies (persistent ChatGPT login)
+└── .gitignore
 ```
 
 ## Import Map
 
 ```
-main.py
-  ├── core.setup            (is_first_run, run_setup)  -- checked before other imports
-  ├── core.session          (ChatGPTSession)
-  ├── core.artifact_sweep   (snapshot_dirs, sweep_artifacts)
-  ├── skills.chatgpt_skill  (save_response, append_to_log)
-  ├── skills.ssh_skill      (ssh_run, ssh_run_live, ssh_run_detached, sftp_upload)
-  └── skills.extract_skill  (extract_blocks, classify_blocks, extract_timeout_hint)
-
-skills/chatgpt_skill.py
-  ├── core.selectors
-  └── core.session
-
-core/session.py
-  └── core.selectors
-
-core/setup.py                (no internal imports, stdlib only)
-core/artifact_sweep.py       (no internal imports, stdlib only)
-skills/ssh_skill.py          (no internal imports, reads .env)
-skills/extract_skill.py      (no internal imports, pure regex)
-core/selectors.py            (no imports, just constants)
-
-tests.py
-  ├── main                   (run_pipeline)  -- imported at call time, not module level
-  └── core.session           (ChatGPTSession)  -- for LLM assertion phase
+main.py -> core.setup, core.session, core.artifact_sweep,
+           skills.chatgpt_skill, skills.ssh_skill, skills.extract_skill
+skills/chatgpt_skill.py -> core.selectors, core.session
+core/session.py -> core.selectors
+core/ui.py -> main (run_pipeline, run_followup_pipeline), core.session, skills.chatgpt_skill
+core/setup.py, core/artifact_sweep.py, skills/ssh_skill.py, skills/extract_skill.py, core/selectors.py -- no internal imports
+tests.py -> main (run_pipeline), core.session (for LLM assertion)
 ```
 
 ## Key Design Decisions
 
-### The LLM is the brain, VerifyBot is the tool
-VerifyBot does NOT try to diagnose errors, pick strategies, or add intelligence. It captures output faithfully and sends it back to the LLM. As LLMs improve, the tool gets better for free. Hardcoding heuristics is a losing game.
+- **LLM is the brain**: Agent doesn't diagnose errors or pick strategies. It captures output and sends it back. As LLMs improve, the tool improves for free.
+- **LLM verifies, not exit codes**: Full stdout/stderr goes to ChatGPT which responds PASS/FAIL/REVISE. Even exit-0 with wrong output gets caught.
+- **Versioned files, never overwrite**: Programs and outputs use `_1`, `_2`, `_3` suffixes. Duplicates auto-detected and skipped.
+- **Local = Python only**: Local target forces Python (uses subprocess/os/pathlib for everything). Eliminates bash-on-Windows issues. Pi target supports bash/Python/C/C++.
+- **Browser-based, not API**: Playwright automates ChatGPT's UI. No API keys, no per-token costs. Response detection uses stability checks (content stops growing for 5s).
+- **Prompt engineering**: LLM told to put ALL code in one fenced block, no text after closing fence. Also supports `TIMEOUT: N` hints for long-running scripts.
+- **Context injection**: Before first prompt, probes target (hostname, Python version, pip list, GPIO/I2C state for Pi) and injects as system context.
+- **Live streaming**: Pi execution streams stdout/stderr in real-time via `ssh_run_live()`. Local shows source + command + output + exit status.
+- **CRLF normalization**: Strips `\r` before saving to `programs/` to prevent bash errors on Pi.
+- **Artifact sweep**: After local execution, diffs filesystem for new non-code files, moves them to `outputs/`. Code files stay in place.
 
-### LLM verifies output, not exit codes
-After executing code, VerifyBot sends the full stdout/stderr back to ChatGPT and asks: "Does this correctly complete the task?" The LLM responds PASS, FAIL (with fix), or REVISE (with changes). This means even a program that exits 0 but produces wrong output gets caught. VerifyBot never decides success or failure — the LLM does.
+## Workbench UI
 
-### Versioned programs and outputs — never overwrite
-Every attempt saves files with `_1`, `_2`, `_3` suffixes. `programs/prime_gen_1.py` is attempt 1, `programs/prime_gen_2.py` is the fix. `outputs/prime_gen_1.txt` has the stdout/stderr from attempt 1. You always have full history to see what changed between versions. Duplicate scripts (identical code across prompts) are automatically detected and skipped.
-
-### Raw markdown logs include everything
-The `raw_md/` transcript files embed saved scripts and execution outputs inline in chronological order. Each pipeline run produces a single `.md` file that contains: the prompts sent, LLM responses, saved script contents (with language-fenced code), and execution outputs. This means you can read one file and see the entire conversation + code + results without jumping between directories.
-
-### Terminology: "Prompts" not "Attempts"
-Each interaction with the LLM in a pipeline run is called a "Prompt" (Prompt 1, Prompt 2, etc.) in all logs and output files. Prompt 1 is the initial request, subsequent prompts are verification/retry cycles.
-
-### Context injection at startup
-Before the first prompt, VerifyBot SSHs into the Pi and gathers: hostname, kernel, Python version, pip packages, working directory contents, disk/memory, running processes, I2C/GPIO/serial state. This is saved to `context/raspi.md` and injected into the initial prompt. On each new chat, the probe runs again and picks up any changes the previous session made. For local targets, context includes the git branch, bash availability, and installed compilers.
-
-### Prompt engineering for reliable extraction
-The initial prompt tells the LLM to put ALL code in exactly ONE fenced code block, and to put NO text after the closing fence. This prevents ChatGPT's usage instructions ("Save as...", "How to run...") from leaking into the extracted code. The prompt also stresses simplicity: fewer lines = fewer bugs.
-
-### LLM-predicted timeouts
-The LLM is prompted to include `TIMEOUT: <seconds>` when it knows a script needs longer than the default 30s. VerifyBot reads this and adjusts the execution timeout. This solves the false-negative problem where long-running scripts get killed prematurely.
-
-### No mode detection -- just execute what you get
-The old system had separate "terminal loop" and "file pipeline" modes with regex-based routing. v2 removes this: the LLM responds with scripts, bash commands, or both. VerifyBot extracts and executes whatever it gets, in order. No upfront mode decision needed.
-
-### Local target = Python only
-When target is `local`, the LLM is told to ALWAYS write Python. Even for simple tasks like creating folders, running git commands, or moving files -- the LLM uses `subprocess.run()`, `os`, `shutil`, and `pathlib` instead of bash. This eliminates all bash-on-Windows problems (WSL path mangling, Git Bash detection, cmd.exe incompatibilities). If the LLM writes a `.sh` script anyway, `run_script_local` returns a clear error telling it to rewrite in Python. The Raspberry Pi target still supports bash, Python, and C/C++ since it's native Linux over SSH.
-
-### Browser-based LLM, not API
-Uses Playwright to automate ChatGPT's browser UI. No API keys, no per-token costs. The LLM layer is a clean interface (core/session.py) that could be swapped for any browser-based LLM. Response detection uses a stability check -- after the stop-generating button disappears, it waits for content to stabilize before extracting, preventing premature extraction of partial responses.
-
-### First-time setup wizard
-On the very first run, `main.py` detects that `.setup_complete` doesn't exist and runs `core/setup.py` -- an interactive terminal wizard that installs dependencies, sets up the browser, configures Pi credentials, and creates directories. After setup, it writes `.setup_complete` and never runs again. Delete the marker file to re-run setup. The check happens before importing playwright or paramiko, so it works even on a totally fresh machine with no dependencies installed.
-
-### Live terminal streaming for Pi execution
-When scripts or commands run on the Pi, output streams to your terminal in real-time via `ssh_run_live()`. You see every print statement, every error, every status message as it happens -- not just a captured dump after execution finishes. Output is formatted with box-drawing characters and color-coded (red for stderr). The original `ssh_run()` still exists for non-interactive use (probing, quick commands).
-
-### Visual code display for local execution
-When scripts run locally, the terminal shows: (1) the full source code with line numbers, (2) the exact command being executed, (3) the complete stdout and stderr output, and (4) the exit status. This makes it easy to see exactly what the LLM wrote and what happened when it ran.
-
-### CRLF normalization on save
-Scripts extracted from ChatGPT's DOM on Windows may carry `\r\n` line endings. Before saving to `programs/`, all `\r` characters are stripped and files are written with explicit `\n` (Unix LF). This prevents `$'\r': command not found` errors when bash scripts are uploaded and run on the Pi.
-
-### Compilation happens on the target
-C/C++ files are uploaded to the Pi (or kept local) and compiled there. No cross-compilation complexity. The target machine has the right toolchain for itself.
-
-## Usage
-
-```bash
-# First time: log in to ChatGPT manually
-python main.py --login
-
-# Basic usage (target auto-detected from prompt keywords)
-python main.py "make a random word generator for raspi"
-python main.py "write a fizzbuzz" --target local
-python main.py "kill the infinite counter script"
-
-# Debugging hardware
-python main.py "why is my I2C sensor not responding"
-python main.py "set up CAN bus between Pi and STM32"
-
-# Options
-python main.py "stress test" --max-retries 5 --timeout 120
-python main.py "blink LED" --headless
-python main.py "read sensor" --remote-dir /home/scoobyxd/hw/pi
-
-# SSH skill standalone
-python -m skills.ssh_skill --test
-python -m skills.ssh_skill --run "ls -la ~/Documents"
-```
+`core/ui.py` serves a Flask+SocketIO web UI at `http://127.0.0.1:5000`:
+- Infinite canvas with draggable, resizable agent panels (drag header, resize from any edge/corner)
+- Each agent panel shows split-view: live terminal output (left) + live ChatGPT browser screenshot (right)
+- Follow-up prompts within each panel (multi-turn in same ChatGPT conversation)
+- File upload via drag-drop, paste, or attach button (uploaded to `uploads/`, text previews injected into prompt)
+- Toolbar dropdowns for History (raw_md), Programs, Outputs, Uploads -- each with Clear All button
+- Run Tests button spawns agent panels per test stream with live output and browser view
+- Each agent gets its own cloned browser profile (avoids Playwright lock conflicts)
+- Profiles cleaned up on agent close; `.browser_profiles/` dir purged after tests
 
 ## CLI Flags
 
 | Flag | Default | What it does |
 |------|---------|-------------|
-| `"prompt"` | (required) | Natural language task |
-| `--target local/raspi` | auto-detect | Force execution target |
-| `--headless` | OFF | Hide browser window |
-| `--max-retries N` | 3 | Retry attempts on failure |
-| `--timeout N` | 30 | Default execution timeout (LLM can override with TIMEOUT: hint) |
-| `--remote-dir /path` | ~/Documents | Working directory on Pi |
-| `--login` | — | Open browser for manual ChatGPT login |
+| `"prompt"` | required | Natural language task |
+| `--target` | auto | Force `local` or `raspi` |
+| `--headless` | OFF | Hide browser |
+| `--max-retries N` | 3 | Retry attempts |
+| `--timeout N` | 30 | Execution timeout (LLM can override via TIMEOUT: hint) |
+| `--remote-dir` | ~/Documents | Pi working directory |
+| `--login` | -- | Manual ChatGPT login |
 
 ## Dependencies
 
-Dependencies are installed automatically by the first-time setup wizard. If you need to install manually:
-
-```bash
-pip install playwright paramiko
-playwright install chromium
-```
-
-| Package | Purpose |
-|---------|---------|
-| playwright | Browser automation for ChatGPT |
-| paramiko | SSH/SFTP to Raspberry Pi |
+Auto-installed by setup wizard. Manual: `pip install playwright paramiko flask flask-socketio && playwright install chromium`.
 
 ## Rules
 
-1. ASCII only in all generated code and output. No emojis, no Unicode symbols.
-2. SSH credentials live in `.env` (gitignored). Never hardcode.
-3. All skill files use `_skill` suffix in their filename.
-4. `__init__.py` files are required in `core/` and `skills/`. Do not delete.
-5. Context files in `context/` are auto-generated. Do not manually edit.
-6. The `programs/` directory keeps ALL versions. Files are named `slug_1.py`, `slug_2.py`, etc.
-7. The `outputs/` directory keeps ALL execution outputs. Same versioning scheme.
-8. `raw_md/` contains full pipeline transcripts for debugging VerifyBot itself.
-9. **Dotfiles lose their leading dot when downloaded from Claude.ai.** After downloading, rename `gitignore` to `.gitignore` and `env` to `.env`. This is a browser download artifact, not a bug in the code.
-10. **Pycache auto-cleanup.** `main.py` deletes all `__pycache__/` directories on startup. You do NOT need to manually delete them when updating files.
-11. **Browser login persistence.** ChatGPT cookies are saved in `.browser_profile/`. Run `python main.py --login` once to log in manually. If the browser opens without being logged in, your `.browser_profile/` directory may have been deleted or moved -- run `--login` again. Do NOT delete `.browser_profile/` unless you want to re-login.
-12. **First-run setup.** `core/.setup_complete` is a marker file created after the setup wizard finishes. Delete it to re-run setup. Do NOT commit it to git.
-13. **Test suite.** `tests.py` runs real prompts through the full pipeline. It runs automatically during first-time setup and can be run anytime with `python tests.py`. Add new tests by appending to the `TESTS` list.
-14. **Parallel test streams.** Tests are grouped into "streams" by their `stream` field. Each stream runs in its own thread with its own browser session (its own ChatGPT agent). Dependent tests share a stream and run sequentially within it; independent tests get separate streams and run concurrently. This is a basic multi-agent swarm pattern.
-15. **Browser profile cloning for parallelism.** Playwright's `launch_persistent_context` locks the `user_data_dir` — only one Chromium instance can use it at a time. To run N parallel agents, `tests.py` copies `.browser_profile/` into `.browser_profile_A/`, `.browser_profile_B/`, etc. before launching threads. Each agent gets its own copy with the same cookies/session. Cloned profiles are cleaned up after tests finish. This is why agents B/C/D crashed in the first run — they all tried to share one profile.
-16. **test.md.** Every test run produces `raw_md/test.md` containing the complete record of every test: status, stream, target, prompt, elapsed time, and any errors. After all streams finish, the file gets a summary table and an LLM assertion section where ChatGPT reviews the results and gives a final verdict. Both the summary table and console output sort results by test number for consistency.
-17. **LLM assertion.** After all tests complete, `raw_md/test.md` is fed to a fresh ChatGPT session that reviews every result and produces a VERDICT. This closes the loop: the LLM runs the code AND judges the test suite. The verdict is appended to test.md and printed to the console. Error messages in test.md are truncated to the first line to keep the record clean.
-18. **Stream assignment.** When adding new tests, set `"stream": "X"` where X is a unique letter for independent tests, or reuse an existing stream letter for tests that depend on each other. Use `"depends_on": N` to declare that test N must pass first. Tests in the same stream share a sequential execution order; different streams run in parallel.
-19. **Artifact sweep.** After each local script execution, `core/artifact_sweep.py` diffs the filesystem to find newly created non-code files (txt, csv, json, etc.) in the project root and `programs/`. These get moved to `outputs/` automatically. Code files (.py, .sh, .c, etc.) stay where they are. Files written to explicit external paths (e.g. `~/Documents/report.txt`) are left alone — the sweep only touches the project root and `programs/`. Name collisions in `outputs/` are handled with timestamps.
+1. ASCII only in generated code/output. No emojis or Unicode symbols.
+2. SSH creds in `.env` (gitignored). Never hardcode.
+3. Skill files use `_skill` suffix. `__init__.py` required in `core/` and `skills/`.
+4. `context/` is auto-generated, don't manually edit. `programs/` and `outputs/` keep ALL versions.
+5. `raw_md/` transcripts embed scripts + outputs inline chronologically.
+6. `.setup_complete` marker = setup done. Delete to re-run. Don't commit.
+7. `.browser_profile/` = saved cookies. `--login` to re-auth. Don't delete unless re-logging in.
+8. `main.py` auto-cleans `__pycache__/` on startup.
+
+## Test System
+
+- Tests in `TESTS` list in `tests.py`, grouped by `stream` field. Each stream = own thread + own browser + own agent panel.
+- Dependent tests share a stream (`depends_on: N`). Independent tests get separate streams for parallelism.
+- Each stream clones `.browser_profile/` into `.browser_profile_X/` (Playwright needs exclusive user_data_dir). Cloned profiles cleaned after tests.
+- UI test runner (`Run Tests` button) creates agent panels per stream showing live terminal + browser screenshots.
+- All pages force-closed on stream completion to prevent orphaned chrome tabs. Profile dirs purged after all streams finish.
+- `raw_md/test.md` records all results. After streams finish, summary table + LLM assertion verdict appended.
+- Results sorted by test number. Error messages truncated to first line in test.md.

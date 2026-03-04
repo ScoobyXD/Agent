@@ -195,10 +195,24 @@ def api_outputs():
                 })
     return jsonify(files[:100])
 
+@app.route("/api/uploads")
+def api_uploads():
+    files = []
+    if UPLOADS_DIR.exists():
+        for f in sorted(UPLOADS_DIR.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
+            if f.is_file():
+                files.append({
+                    "name": f.name,
+                    "size": f.stat().st_size,
+                    "modified": datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M"),
+                })
+    return jsonify(files[:100])
+
 @app.route("/api/file/<path:subdir>/<path:filename>")
 def api_file(subdir, filename):
     dir_map = {"raw_md": RAW_MD_DIR, "programs": PROGRAMS_DIR,
-               "outputs": OUTPUTS_DIR, "context": CONTEXT_DIR}
+               "outputs": OUTPUTS_DIR, "context": CONTEXT_DIR,
+               "uploads": UPLOADS_DIR}
     base = dir_map.get(subdir)
     if not base:
         return jsonify({"error": "Invalid directory"}), 404
@@ -212,9 +226,10 @@ def api_file(subdir, filename):
 
 @app.route("/api/clear/<path:folder>", methods=["POST"])
 def api_clear(folder):
-    """Clear all files in a folder (history, programs, or outputs)."""
+    """Clear all files in a folder (history, programs, outputs, or uploads)."""
     import shutil as _shutil
-    dir_map = {"history": RAW_MD_DIR, "programs": PROGRAMS_DIR, "outputs": OUTPUTS_DIR}
+    dir_map = {"history": RAW_MD_DIR, "programs": PROGRAMS_DIR,
+               "outputs": OUTPUTS_DIR, "uploads": UPLOADS_DIR}
     target = dir_map.get(folder)
     if not target or not target.exists():
         return jsonify({"error": "Invalid folder"}), 400
@@ -602,9 +617,15 @@ def on_run_agent(data):
         except Exception as e:
             socketio.emit("agent_error", {"agent_id": agent_id, "error": str(e)}, to=sid)
         finally:
-            # Close the browser session
+            # Close the browser session -- force-close all pages first
             if session:
                 try:
+                    if session._ctx:
+                        for pg in session._ctx.pages:
+                            try:
+                                pg.close()
+                            except Exception:
+                                pass
                     session.__exit__(None, None, None)
                 except Exception:
                     pass
@@ -845,7 +866,21 @@ def on_run_tests(data):
                     finally:
                         if session:
                             try:
+                                # Force-close all pages to prevent orphaned chrome tabs
+                                if session._ctx:
+                                    for pg in session._ctx.pages:
+                                        try:
+                                            pg.close()
+                                        except Exception:
+                                            pass
                                 session.__exit__(None, None, None)
+                            except Exception:
+                                pass
+                        # Clean up the cloned profile for this stream
+                        if profile_dir and profile_dir.exists():
+                            try:
+                                import shutil as _shutil_stream
+                                _shutil_stream.rmtree(str(profile_dir), ignore_errors=True)
                             except Exception:
                                 pass
                         with _agent_sessions_lock:
@@ -870,11 +905,21 @@ def on_run_tests(data):
             # Cleanup cloned profiles
             cleanup_cloned_profiles(stream_ids)
 
-            # Also clean any .browser_profiles/ dirs
+            # Also clean any .browser_profiles/ dirs (retry with delay if locked)
             profiles_dir = ROOT / ".browser_profiles"
             if profiles_dir.exists():
                 import shutil as _shutil3
+                time.sleep(1)  # brief delay for Chromium file locks to release
                 _shutil3.rmtree(str(profiles_dir), ignore_errors=True)
+
+            # Clean any leftover .browser_profile_* dirs from tests.py clone_profile
+            for p in ROOT.iterdir():
+                if p.is_dir() and p.name.startswith(".browser_profile_"):
+                    try:
+                        import shutil as _shutil4
+                        _shutil4.rmtree(str(p), ignore_errors=True)
+                    except Exception:
+                        pass
 
             # Write summary
             total = len(results)
@@ -1322,7 +1367,7 @@ html,body{height:100%;overflow:hidden;font-family:'DM Sans',sans-serif;backgroun
   <div class="sep"></div>
 
   <div class="dropdown-wrap">
-    <button class="tb-btn" onclick="toggleDropdown('historyDrop')">History</button>
+    <button class="tb-btn" onclick="toggleDropdown('historyDrop')"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#f59e0b" stroke-width="2" style="vertical-align:-2px;margin-right:3px"><path d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>History</button>
     <div class="dropdown-panel" id="historyDrop">
       <div class="dropdown-header">Pipeline History <button class="clear-btn" onclick="clearFolder('history','historyList')">Clear All</button></div>
       <div class="dropdown-list" id="historyList"></div>
@@ -1330,7 +1375,7 @@ html,body{height:100%;overflow:hidden;font-family:'DM Sans',sans-serif;backgroun
   </div>
 
   <div class="dropdown-wrap">
-    <button class="tb-btn" onclick="toggleDropdown('programsDrop')">Programs</button>
+    <button class="tb-btn" onclick="toggleDropdown('programsDrop')"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#8b5cf6" stroke-width="2" style="vertical-align:-2px;margin-right:3px"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>Programs</button>
     <div class="dropdown-panel" id="programsDrop">
       <div class="dropdown-header">Saved Programs <button class="clear-btn" onclick="clearFolder('programs','programsList')">Clear All</button></div>
       <div class="dropdown-list" id="programsList"></div>
@@ -1338,10 +1383,18 @@ html,body{height:100%;overflow:hidden;font-family:'DM Sans',sans-serif;backgroun
   </div>
 
   <div class="dropdown-wrap">
-    <button class="tb-btn" onclick="toggleDropdown('outputsDrop')">Outputs</button>
+    <button class="tb-btn" onclick="toggleDropdown('outputsDrop')"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#22d3ee" stroke-width="2" style="vertical-align:-2px;margin-right:3px"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>Outputs</button>
     <div class="dropdown-panel" id="outputsDrop">
       <div class="dropdown-header">Execution Outputs <button class="clear-btn" onclick="clearFolder('outputs','outputsList')">Clear All</button></div>
       <div class="dropdown-list" id="outputsList"></div>
+    </div>
+  </div>
+
+  <div class="dropdown-wrap">
+    <button class="tb-btn" onclick="toggleDropdown('uploadsDrop')"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#34d399" stroke-width="2" style="vertical-align:-2px;margin-right:3px"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>Uploads</button>
+    <div class="dropdown-panel" id="uploadsDrop">
+      <div class="dropdown-header">Uploaded Files <button class="clear-btn" onclick="clearFolder('uploads','uploadsList')">Clear All</button></div>
+      <div class="dropdown-list" id="uploadsList"></div>
     </div>
   </div>
 
@@ -1383,8 +1436,8 @@ html,body{height:100%;overflow:hidden;font-family:'DM Sans',sans-serif;backgroun
   <div class="confirm-box">
     <div class="confirm-msg" id="confirmMsg">Are you sure?</div>
     <div class="confirm-btns">
-      <button class="btn-confirm" id="confirmOk" onclick="confirmOk()">Delete</button>
       <button class="btn-cancel" onclick="confirmCancel()">Cancel</button>
+      <button class="btn-confirm" id="confirmOk" onclick="confirmOk()">Delete</button>
     </div>
   </div>
 </div>
@@ -1395,7 +1448,7 @@ html,body{height:100%;overflow:hidden;font-family:'DM Sans',sans-serif;backgroun
     <div class="welcome" id="welcome">
       <div class="icon">V</div>
       <h2>VerifyBot Workbench</h2>
-      <p>Type a prompt below. Each task spawns an agent panel here. Drag headers to reorder, resize from corners, maximize with the button.</p>
+      <p>Type a prompt below. Each task spawns an agent panel here. Drag headers to reorder, resize from any edge or corner.</p>
       <div class="examples">
         <div class="example-chip" onclick="useExample(this)">write a fizzbuzz script</div>
         <div class="example-chip" onclick="useExample(this)">make a random number generator</div>
@@ -1642,22 +1695,6 @@ socket.on('agent_running', d => {
   updateGlobalStatus();
 });
 
-function toggleMax(id) {
-  const el = agents[id]?.el;
-  if (el) {
-    el.classList.remove('minimized');
-    el.classList.toggle('maximized');
-  }
-}
-
-function toggleMin(id) {
-  const el = agents[id]?.el;
-  if (el) {
-    el.classList.remove('maximized');
-    el.classList.toggle('minimized');
-  }
-}
-
 function closePanel(id) {
   const a = agents[id];
   if (a) {
@@ -1704,11 +1741,6 @@ function makeDraggable(panel, handle) {
     if (!dragging) return;
     dragging = false;
     panel.style.zIndex = '';
-    // If user clicked header without dragging, toggle minimize
-    if (!moved) {
-      const id = panel.id;
-      if (id && agents[id]) toggleMin(id);
-    }
   });
 }
 
@@ -2044,6 +2076,7 @@ function toggleDropdown(id) {
     if (id === 'historyDrop') loadHistory();
     else if (id === 'programsDrop') loadPrograms();
     else if (id === 'outputsDrop') loadOutputs();
+    else if (id === 'uploadsDrop') loadUploads();
   }
 }
 document.addEventListener('click', e => {
@@ -2083,6 +2116,17 @@ async function loadOutputs() {
       '<div class="dropdown-item" onclick="viewFile(\'outputs\',\'' + esc(i.name) + '\')">' +
         esc(i.name) + '<div class="meta">' + i.modified + ' &middot; ' + (i.size / 1024).toFixed(1) + 'KB</div></div>'
     ).join('') : '<div class="dropdown-item" style="color:var(--tx3)">No outputs</div>';
+  } catch (e) { list.innerHTML = '<div class="dropdown-item">Error loading</div>'; }
+}
+
+async function loadUploads() {
+  const list = document.getElementById('uploadsList');
+  try {
+    const d = await (await fetch('/api/uploads')).json();
+    list.innerHTML = d.length ? d.map(i =>
+      '<div class="dropdown-item" onclick="viewFile(\'uploads\',\'' + esc(i.name) + '\')">' +
+        esc(i.name) + '<div class="meta">' + i.modified + ' &middot; ' + (i.size / 1024).toFixed(1) + 'KB</div></div>'
+    ).join('') : '<div class="dropdown-item" style="color:var(--tx3)">No uploads</div>';
   } catch (e) { list.innerHTML = '<div class="dropdown-item">Error loading</div>'; }
 }
 
