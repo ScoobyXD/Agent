@@ -154,7 +154,7 @@ def api_status():
 def api_history():
     runs = []
     if RAW_MD_DIR.exists():
-        for f in sorted(RAW_MD_DIR.iterdir(), reverse=True):
+        for f in sorted(RAW_MD_DIR.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
             if f.suffix == ".md":
                 try:
                     content = f.read_text(encoding="utf-8", errors="replace")
@@ -173,7 +173,7 @@ def api_history():
 def api_programs():
     files = []
     if PROGRAMS_DIR.exists():
-        for f in sorted(PROGRAMS_DIR.iterdir(), reverse=True):
+        for f in sorted(PROGRAMS_DIR.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
             if f.is_file():
                 files.append({
                     "name": f.name,
@@ -186,7 +186,7 @@ def api_programs():
 def api_outputs():
     files = []
     if OUTPUTS_DIR.exists():
-        for f in sorted(OUTPUTS_DIR.iterdir(), reverse=True):
+        for f in sorted(OUTPUTS_DIR.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
             if f.is_file():
                 files.append({
                     "name": f.name,
@@ -262,7 +262,7 @@ def api_agent_files(agent_id, folder):
             pass
     elif start_time and target.exists():
         # Match files created after agent start time
-        for f in sorted(target.iterdir(), reverse=True):
+        for f in sorted(target.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
             if f.is_file() and f.stat().st_mtime >= start_time:
                 files.append({
                     "name": f.name,
@@ -792,31 +792,7 @@ html,body{height:100%;overflow:hidden;font-family:'DM Sans',sans-serif;backgroun
 .dropdown-item:hover{background:var(--bg3);color:var(--tx)}
 .dropdown-item .meta{font-size:10px;color:var(--tx3);margin-top:2px}
 
-/* Panel mini file buttons */
-.panel-file-btns{
-  display:flex;gap:2px;padding:2px 6px;border-top:1px solid var(--brd);
-  background:var(--bg2);
-}
-.panel-file-btns button{
-  background:none;border:none;color:var(--tx3);font-size:9px;padding:2px 6px;
-  cursor:pointer;border-radius:3px;
-}
-.panel-file-btns button:hover{background:var(--bg3);color:var(--tx)}
-.panel-mini-dropdown{
-  position:absolute;bottom:100%;left:0;right:0;
-  background:var(--bg2);border:1px solid var(--brd);border-radius:8px;
-  max-height:200px;overflow-y:auto;z-index:50;display:none;
-  box-shadow:0 -4px 12px rgba(0,0,0,.3);
-}
-.panel-mini-dropdown.open{display:block}
-.panel-mini-dropdown .pmd-header{
-  padding:5px 8px;font-size:9px;color:var(--tx3);border-bottom:1px solid var(--brd);
-  font-weight:600;
-}
-.panel-mini-dropdown .pmd-item{
-  padding:4px 8px;font-size:10px;color:var(--tx2);cursor:pointer;
-}
-.panel-mini-dropdown .pmd-item:hover{background:var(--bg3);color:var(--tx)}
+/* Panel mini file buttons (removed — now in header as icons) */
 
 /* === FILE VIEWER MODAL === */
 .modal-overlay{
@@ -844,8 +820,12 @@ html,body{height:100%;overflow:hidden;font-family:'DM Sans',sans-serif;backgroun
 
 /* === WORKBENCH === */
 .workbench{
-  flex:1;overflow:auto;padding:12px;display:flex;flex-wrap:wrap;
-  align-content:flex-start;gap:12px;position:relative;
+  flex:1;overflow:hidden;position:relative;cursor:grab;
+}
+.workbench.panning{cursor:grabbing}
+.canvas{
+  position:absolute;width:8000px;height:8000px;
+  transform-origin:0 0;
 }
 
 .welcome{
@@ -871,8 +851,8 @@ html,body{height:100%;overflow:hidden;font-family:'DM Sans',sans-serif;backgroun
   background:var(--bg2);border:1px solid var(--brd);border-radius:10px;
   overflow:hidden;display:flex;flex-direction:column;
   min-width:420px;min-height:48px;
-  width:calc(50% - 6px);height:420px;
-  position:relative;
+  width:680px;height:420px;
+  position:absolute;
 }
 .agent-panel.maximized{
   position:fixed!important;inset:var(--toolbar-h) 0 0 0!important;
@@ -880,9 +860,14 @@ html,body{height:100%;overflow:hidden;font-family:'DM Sans',sans-serif;backgroun
 }
 .agent-panel.minimized .agent-body,
 .agent-panel.minimized .agent-status,
-.agent-panel.minimized .panel-input-bar,
-.agent-panel.minimized .resize-handle{display:none}
-.agent-panel.minimized{height:34px!important;min-height:34px!important;overflow:hidden}
+.agent-panel.minimized .panel-input-bar{display:none}
+.agent-panel.minimized .resize-handle.rh-n,
+.agent-panel.minimized .resize-handle.rh-s,
+.agent-panel.minimized .resize-handle.rh-ne,
+.agent-panel.minimized .resize-handle.rh-nw,
+.agent-panel.minimized .resize-handle.rh-se,
+.agent-panel.minimized .resize-handle.rh-sw{display:none}
+.agent-panel.minimized{height:34px!important;min-height:34px!important;overflow:hidden;min-width:160px}
 
 /* Resize handles on all edges and corners */
 .resize-handle{position:absolute;z-index:5}
@@ -911,6 +896,9 @@ html,body{height:100%;overflow:hidden;font-family:'DM Sans',sans-serif;backgroun
   padding:2px 5px;border-radius:4px;display:flex;align-items:center;
 }
 .agent-head .head-btn:hover{background:var(--bg);color:var(--tx)}
+.agent-head .file-btn{opacity:.5;padding:2px 3px}
+.agent-head .file-btn:hover{opacity:1;background:var(--bg3)}
+.agent-head .head-sep{width:1px;height:14px;background:var(--brd);margin:0 2px;flex-shrink:0}
 
 .agent-body{flex:1;display:flex;overflow:hidden}
 
@@ -1105,6 +1093,28 @@ html,body{height:100%;overflow:hidden;font-family:'DM Sans',sans-serif;backgroun
 .agent-panel.drag-over .drop-overlay{display:flex}
 .prompt-bar.drag-over{outline:2px dashed var(--acc);outline-offset:-2px;border-radius:8px}
 
+/* === IN-APP CONFIRM DIALOG === */
+.confirm-overlay{
+  display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:400;
+  align-items:center;justify-content:center;
+}
+.confirm-overlay.open{display:flex}
+.confirm-box{
+  background:var(--bg2);border:1px solid var(--brd);border-radius:12px;
+  padding:24px;min-width:320px;max-width:420px;text-align:center;
+  box-shadow:0 8px 32px rgba(0,0,0,.4);
+}
+.confirm-box .confirm-msg{font-size:14px;color:var(--tx);margin-bottom:18px}
+.confirm-box .confirm-btns{display:flex;gap:10px;justify-content:center}
+.confirm-box .confirm-btns button{
+  padding:8px 20px;border-radius:8px;border:1px solid var(--brd);
+  font-family:inherit;font-size:12px;cursor:pointer;font-weight:500;
+}
+.confirm-box .btn-cancel{background:var(--bg3);color:var(--tx2)}
+.confirm-box .btn-cancel:hover{background:var(--bg4)}
+.confirm-box .btn-confirm{background:var(--err);border-color:var(--err);color:#fff}
+.confirm-box .btn-confirm:hover{opacity:.85}
+
 ::-webkit-scrollbar{width:5px;height:5px}
 ::-webkit-scrollbar-track{background:transparent}
 ::-webkit-scrollbar-thumb{background:var(--brd);border-radius:3px}
@@ -1177,17 +1187,30 @@ html,body{height:100%;overflow:hidden;font-family:'DM Sans',sans-serif;backgroun
   </div>
 </div>
 
+<!-- CONFIRM DIALOG (in-app themed) -->
+<div class="confirm-overlay" id="confirmOverlay" onclick="if(event.target===this)confirmCancel()">
+  <div class="confirm-box">
+    <div class="confirm-msg" id="confirmMsg">Are you sure?</div>
+    <div class="confirm-btns">
+      <button class="btn-cancel" onclick="confirmCancel()">Cancel</button>
+      <button class="btn-confirm" id="confirmOk" onclick="confirmOk()">Delete</button>
+    </div>
+  </div>
+</div>
+
 <!-- WORKBENCH -->
 <div class="workbench" id="workbench">
-  <div class="welcome" id="welcome">
-    <div class="icon">V</div>
-    <h2>VerifyBot Workbench</h2>
-    <p>Type a prompt below. Each task spawns an agent panel here. Drag headers to reorder, resize from corners, maximize with the button.</p>
-    <div class="examples">
-      <div class="example-chip" onclick="useExample(this)">write a fizzbuzz script</div>
-      <div class="example-chip" onclick="useExample(this)">make a random number generator</div>
-      <div class="example-chip" onclick="useExample(this)">read I2C sensor on raspi</div>
-      <div class="example-chip" onclick="useExample(this)">analyze my CSV data</div>
+  <div class="canvas" id="canvas">
+    <div class="welcome" id="welcome">
+      <div class="icon">V</div>
+      <h2>VerifyBot Workbench</h2>
+      <p>Type a prompt below. Each task spawns an agent panel here. Drag headers to reorder, resize from corners, maximize with the button.</p>
+      <div class="examples">
+        <div class="example-chip" onclick="useExample(this)">write a fizzbuzz script</div>
+        <div class="example-chip" onclick="useExample(this)">make a random number generator</div>
+        <div class="example-chip" onclick="useExample(this)">read I2C sensor on raspi</div>
+        <div class="example-chip" onclick="useExample(this)">analyze my CSV data</div>
+      </div>
     </div>
   </div>
 </div>
@@ -1305,7 +1328,10 @@ socket.on('agent_error', d => {
 
 // === CREATE PANEL ===
 function createPanel(id, prompt, isTest) {
-  const wb = document.getElementById('workbench');
+  // Hide welcome message
+  const welcome = document.getElementById('welcome');
+  if (welcome) welcome.remove();
+
   const panel = document.createElement('div');
   panel.className = 'agent-panel';
   panel.id = id;
@@ -1323,10 +1349,20 @@ function createPanel(id, prompt, isTest) {
     '<div class="resize-handle rh-nw" data-dir="nw"></div>' +
     '<div class="resize-handle rh-se" data-dir="se"></div>' +
     '<div class="resize-handle rh-sw" data-dir="sw"></div>' +
-    // Header
+    // Header with file buttons integrated
     '<div class="agent-head">' +
       '<div class="dot run"></div>' +
       '<span class="label" title="' + safePrompt + '">' + shortPrompt + '</span>' +
+      '<button class="head-btn file-btn" onclick="event.stopPropagation();openAgentFile(\'' + id + '\',\'history\')" title="View log">' +
+        '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>' +
+      '</button>' +
+      '<button class="head-btn file-btn" onclick="event.stopPropagation();openAgentFile(\'' + id + '\',\'programs\')" title="View program">' +
+        '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>' +
+      '</button>' +
+      '<button class="head-btn file-btn" onclick="event.stopPropagation();openAgentFile(\'' + id + '\',\'outputs\')" title="View output">' +
+        '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>' +
+      '</button>' +
+      '<div class="head-sep"></div>' +
       '<button class="head-btn" onclick="toggleMin(\'' + id + '\')" title="Minimize">&#9644;</button>' +
       '<button class="head-btn" onclick="toggleMax(\'' + id + '\')" title="Maximize">&#9634;</button>' +
       '<button class="head-btn" onclick="closePanel(\'' + id + '\')" title="Close">&times;</button>' +
@@ -1349,13 +1385,6 @@ function createPanel(id, prompt, isTest) {
     '</div>' +
     // Status bar
     '<div class="agent-status running">Running...</div>' +
-    // Per-panel file buttons
-    '<div class="panel-file-btns" style="position:relative">' +
-      '<button onclick="togglePanelDrop(\'' + id + '\',\'history\')">History</button>' +
-      '<button onclick="togglePanelDrop(\'' + id + '\',\'programs\')">Programs</button>' +
-      '<button onclick="togglePanelDrop(\'' + id + '\',\'outputs\')">Outputs</button>' +
-      '<div class="panel-mini-dropdown" data-agent="' + id + '"></div>' +
-    '</div>' +
     // In-panel input bar for follow-ups
     '<div class="panel-input-bar">' +
       '<div class="panel-attach-preview" data-agent="' + id + '"></div>' +
@@ -1371,7 +1400,19 @@ function createPanel(id, prompt, isTest) {
       '<input type="file" class="panel-file-input" multiple style="display:none" onchange="panelFiles(\'' + id + '\',this.files)">' +
     '</div>';
 
-  wb.appendChild(panel);
+  // Append to canvas (infinite pan area), not workbench directly
+  const canvas = document.getElementById('canvas');
+
+  // Position new panel in a tiling grid
+  const existing = Object.keys(agents).length;
+  const cols = 2;
+  const gapX = 700, gapY = 440;
+  const col = existing % cols;
+  const row = Math.floor(existing / cols);
+  panel.style.left = (20 + col * gapX) + 'px';
+  panel.style.top = (20 + row * gapY) + 'px';
+
+  canvas.appendChild(panel);
 
   const head = panel.querySelector('.agent-head');
   makeDraggable(panel, head);
@@ -1386,8 +1427,8 @@ function createPanel(id, prompt, isTest) {
     status: panel.querySelector('.agent-status'),
     browserImg: panel.querySelector('.agent-browser-top img'),
     browserPlaceholder: panel.querySelector('.agent-browser-top .placeholder'),
-    panelFiles: [],      // attached File objects for follow-up
-    panelPreviews: [],   // {file, url, isImage} for rendering previews
+    panelFiles: [],
+    panelPreviews: [],
   };
 
   updateGlobalStatus();
@@ -1436,7 +1477,7 @@ function closePanel(id) {
   }
   delete agents[id];
   if (Object.keys(agents).length === 0) {
-    document.getElementById('workbench').innerHTML =
+    document.getElementById('canvas').innerHTML =
       '<div class="welcome" id="welcome">' +
         '<div class="icon">V</div><h2>VerifyBot Workbench</h2>' +
         '<p>Type a prompt below to spawn an agent.</p>' +
@@ -1455,20 +1496,17 @@ function makeDraggable(panel, handle) {
     if (panel.classList.contains('maximized')) return;
     dragging = true;
     moved = false;
-    const r = panel.getBoundingClientRect();
-    const wr = panel.parentElement.getBoundingClientRect();
-    ox = r.left - wr.left + panel.parentElement.scrollLeft;
-    oy = r.top - wr.top + panel.parentElement.scrollTop;
+    ox = parseInt(panel.style.left) || 0;
+    oy = parseInt(panel.style.top) || 0;
     sx = e.clientX; sy = e.clientY;
-    panel.style.position = 'absolute';
-    panel.style.left = ox + 'px';
-    panel.style.top = oy + 'px';
     panel.style.zIndex = 10;
     e.preventDefault();
   });
   document.addEventListener('mousemove', e => {
     if (!dragging) return;
-    const dx = e.clientX - sx, dy = e.clientY - sy;
+    const scale = window._canvas ? window._canvas.getPan().s : 1;
+    const dx = (e.clientX - sx) / scale;
+    const dy = (e.clientY - sy) / scale;
     if (Math.abs(dx) > 3 || Math.abs(dy) > 3) moved = true;
     panel.style.left = (ox + dx) + 'px';
     panel.style.top = (oy + dy) + 'px';
@@ -1490,34 +1528,31 @@ function makeResizable(panel) {
   const handles = panel.querySelectorAll('.resize-handle');
   handles.forEach(h => {
     h.addEventListener('mousedown', e => {
-      if (panel.classList.contains('maximized') || panel.classList.contains('minimized')) return;
+      if (panel.classList.contains('maximized')) return;
+      const isMin = panel.classList.contains('minimized');
       e.preventDefault();
       e.stopPropagation();
       const dir = h.dataset.dir;
+      const scale = window._canvas ? window._canvas.getPan().s : 1;
       const startX = e.clientX, startY = e.clientY;
-      const rect = panel.getBoundingClientRect();
-      const startW = rect.width, startH = rect.height;
-      const startL = panel.offsetLeft, startT = panel.offsetTop;
-
-      // Ensure absolute positioning
-      if (panel.style.position !== 'absolute') {
-        const wr = panel.parentElement.getBoundingClientRect();
-        panel.style.position = 'absolute';
-        panel.style.left = (rect.left - wr.left + panel.parentElement.scrollLeft) + 'px';
-        panel.style.top = (rect.top - wr.top + panel.parentElement.scrollTop) + 'px';
-      }
+      const startW = panel.offsetWidth, startH = panel.offsetHeight;
+      const startL = parseInt(panel.style.left) || 0;
+      const startT = parseInt(panel.style.top) || 0;
 
       const onMove = ev => {
-        const dx = ev.clientX - startX, dy = ev.clientY - startY;
+        const dx = (ev.clientX - startX) / scale;
+        const dy = (ev.clientY - startY) / scale;
         let newW = startW, newH = startH, newL = startL, newT = startT;
 
-        if (dir.includes('e')) newW = Math.max(420, startW + dx);
-        if (dir.includes('w')) { newW = Math.max(420, startW - dx); newL = startL + dx; if (newW <= 420) newL = startL + (startW - 420); }
-        if (dir.includes('s')) newH = Math.max(120, startH + dy);
-        if (dir.includes('n')) { newH = Math.max(120, startH - dy); newT = startT + dy; if (newH <= 120) newT = startT + (startH - 120); }
+        if (dir.includes('e')) newW = Math.max(160, startW + dx);
+        if (dir.includes('w')) { newW = Math.max(160, startW - dx); newL = startL + dx; if (newW <= 160) newL = startL + (startW - 160); }
+        if (!isMin) {
+          if (dir.includes('s')) newH = Math.max(120, startH + dy);
+          if (dir.includes('n')) { newH = Math.max(120, startH - dy); newT = startT + dy; if (newH <= 120) newT = startT + (startH - 120); }
+        }
 
         panel.style.width = newW + 'px';
-        panel.style.height = newH + 'px';
+        if (!isMin) panel.style.height = newH + 'px';
         panel.style.left = newL + 'px';
         panel.style.top = newT + 'px';
       };
@@ -1874,83 +1909,149 @@ async function viewFile(dir, name) {
 }
 function closeModal() { document.getElementById('modalOverlay').classList.remove('open'); }
 
-// === CLEAR FOLDER ===
+// === IN-APP CONFIRM DIALOG ===
+let _confirmResolve = null;
+function appConfirm(msg) {
+  return new Promise(resolve => {
+    _confirmResolve = resolve;
+    document.getElementById('confirmMsg').textContent = msg;
+    document.getElementById('confirmOverlay').classList.add('open');
+  });
+}
+function confirmOk() {
+  document.getElementById('confirmOverlay').classList.remove('open');
+  if (_confirmResolve) { _confirmResolve(true); _confirmResolve = null; }
+}
+function confirmCancel() {
+  document.getElementById('confirmOverlay').classList.remove('open');
+  if (_confirmResolve) { _confirmResolve(false); _confirmResolve = null; }
+}
+
+// === CLEAR FOLDER (themed confirm) ===
 async function clearFolder(folder, listId) {
-  if (!confirm('Clear all files in ' + folder + '?')) return;
+  const ok = await appConfirm('Clear all files in ' + folder + '?');
+  if (!ok) return;
   try {
     const res = await fetch('/api/clear/' + folder, { method: 'POST' });
     const d = await res.json();
     document.getElementById(listId).innerHTML =
       '<div class="dropdown-item" style="color:var(--tx3)">Cleared ' + (d.cleared || 0) + ' files</div>';
   } catch (e) {
-    alert('Error clearing: ' + e);
+    console.error('Error clearing:', e);
   }
 }
 
-// === PER-PANEL FILE BUTTONS ===
-function togglePanelDrop(id, folder) {
-  const a = agents[id];
-  if (!a) return;
-  const dd = a.el.querySelector('.panel-mini-dropdown');
-  if (dd.classList.contains('open') && dd.dataset.folder === folder) {
-    dd.classList.remove('open');
-    return;
-  }
-  dd.dataset.folder = folder;
-  dd.classList.add('open');
-  dd.innerHTML = '<div class="pmd-header">Loading...</div>';
-  loadPanelFiles(id, folder);
-}
-
-async function loadPanelFiles(id, folder) {
-  const a = agents[id];
-  if (!a) return;
-  const dd = a.el.querySelector('.panel-mini-dropdown');
-
+// === ONE-CLICK AGENT FILE OPEN ===
+// Fetches the most recent file for that agent in the given folder and opens it directly
+async function openAgentFile(id, folder) {
   try {
     const res = await fetch('/api/agent_files/' + id + '/' + folder);
     const data = await res.json();
-
     if (!data.length) {
-      dd.innerHTML = '<div class="pmd-header">' + folder + '</div>' +
-        '<div class="pmd-item" style="color:var(--tx3)">No files yet</div>';
+      // Brief tooltip-style feedback
+      showToast('No ' + folder + ' files yet');
       return;
     }
-
-    let html = '<div class="pmd-header">' + folder + '</div>';
+    // Open the most recent file directly (already sorted by mtime desc)
+    const item = data[0];
     if (folder === 'history') {
-      data.forEach(item => {
-        html += '<div class="pmd-item" onclick="viewFile(\'raw_md\',\'' + esc(item.filename) + '\');closePanelDrop(\'' + id + '\')">' +
-          esc(item.prompt || item.filename) + '</div>';
-      });
+      viewFile('raw_md', item.filename);
     } else {
       const dir = folder === 'programs' ? 'programs' : 'outputs';
-      data.forEach(item => {
-        html += '<div class="pmd-item" onclick="viewFile(\'' + dir + '\',\'' + esc(item.name) + '\');closePanelDrop(\'' + id + '\')">' +
-          esc(item.name) + '<span style="color:var(--tx3);font-size:8px;margin-left:4px">' +
-          (item.size / 1024).toFixed(1) + 'KB</span></div>';
-      });
+      viewFile(dir, item.name);
     }
-    dd.innerHTML = html;
   } catch (e) {
-    dd.innerHTML = '<div class="pmd-header">' + folder + '</div>' +
-      '<div class="pmd-item" style="color:var(--err)">Error loading</div>';
+    showToast('Error loading ' + folder);
   }
 }
 
-function closePanelDrop(id) {
-  const a = agents[id];
-  if (!a) return;
-  const dd = a.el.querySelector('.panel-mini-dropdown');
-  if (dd) dd.classList.remove('open');
+// Minimal toast notification
+function showToast(msg) {
+  let toast = document.getElementById('toast');
+  if (!toast) {
+    toast = document.createElement('div');
+    toast.id = 'toast';
+    toast.style.cssText = 'position:fixed;bottom:80px;left:50%;transform:translateX(-50%);' +
+      'background:var(--bg2);border:1px solid var(--brd);color:var(--tx2);padding:8px 16px;' +
+      'border-radius:8px;font-size:12px;z-index:500;opacity:0;transition:opacity .2s;pointer-events:none';
+    document.body.appendChild(toast);
+  }
+  toast.textContent = msg;
+  toast.style.opacity = '1';
+  setTimeout(() => { toast.style.opacity = '0'; }, 1800);
 }
 
-// Close panel dropdown on outside click
-document.addEventListener('click', e => {
-  if (!e.target.closest('.panel-file-btns')) {
-    document.querySelectorAll('.panel-mini-dropdown.open').forEach(d => d.classList.remove('open'));
+// === INFINITE CANVAS (Prezi-style pan & zoom) ===
+(function initCanvas() {
+  const wb = document.getElementById('workbench');
+  const canvas = document.getElementById('canvas');
+  let panX = 0, panY = 0, scale = 1;
+  let isPanning = false, startX, startY, startPanX, startPanY;
+
+  function applyTransform() {
+    canvas.style.transform = 'translate(' + panX + 'px,' + panY + 'px) scale(' + scale + ')';
   }
-});
+
+  // Center the canvas initially so (0,0) is near top-left of view
+  panX = 20;
+  panY = 20;
+  applyTransform();
+
+  // Pan: click & drag on empty workbench space
+  wb.addEventListener('mousedown', e => {
+    // Only pan if clicking directly on workbench or canvas bg, not on a panel
+    if (e.target !== wb && e.target !== canvas && !e.target.classList.contains('welcome')
+        && !e.target.closest('.welcome')) return;
+    isPanning = true;
+    startX = e.clientX; startY = e.clientY;
+    startPanX = panX; startPanY = panY;
+    wb.classList.add('panning');
+    e.preventDefault();
+  });
+
+  document.addEventListener('mousemove', e => {
+    if (!isPanning) return;
+    panX = startPanX + (e.clientX - startX);
+    panY = startPanY + (e.clientY - startY);
+    applyTransform();
+  });
+
+  document.addEventListener('mouseup', () => {
+    if (isPanning) {
+      isPanning = false;
+      wb.classList.remove('panning');
+    }
+  });
+
+  // Zoom: scroll wheel
+  wb.addEventListener('wheel', e => {
+    // Only zoom if Ctrl is held or on empty area
+    if (!e.ctrlKey) return;
+    e.preventDefault();
+    const rect = wb.getBoundingClientRect();
+    const mx = e.clientX - rect.left;
+    const my = e.clientY - rect.top;
+
+    const oldScale = scale;
+    const delta = e.deltaY > 0 ? 0.9 : 1.1;
+    scale = Math.max(0.2, Math.min(3, scale * delta));
+
+    // Zoom toward mouse position
+    panX = mx - (mx - panX) * (scale / oldScale);
+    panY = my - (my - panY) * (scale / oldScale);
+    applyTransform();
+  }, { passive: false });
+
+  // Reset view: double-click on empty canvas area
+  wb.addEventListener('dblclick', e => {
+    if (e.target !== wb && e.target !== canvas) return;
+    panX = 20; panY = 20; scale = 1;
+    applyTransform();
+  });
+
+  // Expose for panel creation positioning
+  window._canvas = { getPan: () => ({x: panX, y: panY, s: scale}) };
+})();
 
 function updateGlobalStatus() {
   const dot = document.getElementById('statusDot');
