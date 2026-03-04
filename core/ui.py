@@ -85,14 +85,32 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 class AgentWriter:
     """Captures stdout/stderr and routes to a specific agent panel via WS.
 
+    Uses thread-local storage so concurrent agent threads don't clobber
+    each other's agent_id / sid.
+
     On Windows, the original console may use cp1252 which can't handle
     Unicode box-drawing chars etc. We catch those encoding errors silently.
     """
     def __init__(self, original, stream_name="stdout"):
         self.original = original
         self.stream_name = stream_name
-        self.agent_id = None
-        self.sid = None
+        self._local = threading.local()
+
+    @property
+    def agent_id(self):
+        return getattr(self._local, 'agent_id', None)
+
+    @agent_id.setter
+    def agent_id(self, value):
+        self._local.agent_id = value
+
+    @property
+    def sid(self):
+        return getattr(self._local, 'sid', None)
+
+    @sid.setter
+    def sid(self, value):
+        self._local.sid = value
 
     def write(self, text):
         if self.original:
@@ -759,6 +777,7 @@ def on_run_tests(data):
             passed_lock = threading.Lock()
             stream_threads = []
             stream_ids = list(streams.keys())
+            test_suite_start = time.time()
 
             for stream_id, stream_tests in streams.items():
                 # Create an agent panel for this stream
@@ -873,6 +892,20 @@ def on_run_tests(data):
                             else:
                                 all_passed = False
 
+                            # Update md_path so file buttons can find logs
+                            try:
+                                latest_md = max(
+                                    (f for f in RAW_MD_DIR.iterdir() if f.is_file() and f.suffix == '.md'),
+                                    key=lambda p: p.stat().st_mtime, default=None
+                                )
+                                if latest_md and latest_md.stat().st_mtime >= test_start:
+                                    with _agent_sessions_lock:
+                                        si = _agent_sessions.get(agent_id)
+                                        if si:
+                                            si["md_path"] = latest_md
+                            except Exception:
+                                pass
+
                             status = "PASS" if passed else "FAIL"
                             print(f"\n[{status}] Test {num}: {test['name']} ({elapsed:.1f}s)")
 
@@ -966,7 +999,15 @@ def on_run_tests(data):
             }, to=sid)
             print(summary_text, file=sys.__stdout__)
 
-            write_summary(results)
+            try:
+                total_time = time.time() - test_suite_start
+                write_summary(results, total_time, len(streams))
+            except TypeError:
+                # Fallback if write_summary signature changed
+                try:
+                    write_summary(results)
+                except Exception:
+                    pass
 
             # Mark the coordinator panel as done
             socketio.emit("agent_done", {
@@ -1268,6 +1309,8 @@ html,body{height:100%;overflow:hidden;font-family:'DM Sans',sans-serif;backgroun
 .agent-status.running{color:var(--acc)}
 .agent-status.pass{color:var(--ok)}
 .agent-status.fail{color:var(--err)}
+.copy-output-btn{background:none;border:none;color:inherit;cursor:pointer;padding:2px 4px;margin-left:6px;opacity:0.6;vertical-align:middle}
+.copy-output-btn:hover{opacity:1}
 
 /* === INPUT BAR === */
 .input-bar{
@@ -1552,6 +1595,20 @@ socket.on('agent_output', d => {
     if (!raw && raw !== '') continue;
     const line = stripAnsi(raw);
 
+    // Filter out greenlet/playwright cross-thread noise
+    if (line.includes('greenlet.error') || line.includes('Cannot switch to a different thread') ||
+        line.includes('_sync_base.py') || line.includes('g_self.switch()') ||
+        line.includes('Exception in callback SyncBase') ||
+        (line.trim().startsWith('Current:') && line.includes('greenlet')) ||
+        (line.trim().startsWith('Expected:') && line.includes('greenlet')) ||
+        (line.trim().startsWith('handle:') && line.includes('Handle SyncBase')) ||
+        (line.trim().startsWith('File "') && line.includes('_sync_base')) ||
+        (line.trim().startsWith('task.add_done_callback')) ||
+        line.includes('(otid=') ||
+        (line.trim() === '~~~~~~~~~~~~~^^') ||
+        (line.trim().startsWith('~') && line.trim().endsWith('^^'))
+    ) continue;
+
     const span = document.createElement('span');
     span.className = 'line';
 
@@ -1594,6 +1651,17 @@ socket.on('agent_output', d => {
   term.scrollTop = term.scrollHeight;
 });
 
+function copyTerminal(id) {
+  const a = agents[id];
+  if (!a) return;
+  const text = a.terminal.innerText;
+  navigator.clipboard.writeText(text).then(() => {
+    // Flash the button to confirm
+    const btn = a.status.querySelector('.copy-output-btn');
+    if (btn) { btn.style.color = '#34d399'; setTimeout(() => btn.style.color = '', 1000); }
+  });
+}
+
 function stripAnsi(s) {
   // Remove ANSI escape sequences
   return s.replace(/\x1b\[[0-9;]*m/g, '').replace(/\033\[[0-9;]*m/g, '');
@@ -1605,7 +1673,11 @@ socket.on('agent_done', d => {
   const ok = d.success;
   a.dot.className = 'dot ' + (ok ? 'pass' : 'fail');
   a.status.className = 'agent-status ' + (ok ? 'pass' : 'fail');
-  a.status.textContent = ok ? 'PASS \u2014 completed' : 'FAIL \u2014 see output';
+  a.status.innerHTML = (ok ? 'PASS \u2014 completed' : 'FAIL \u2014 see output') +
+    ' <button class="copy-output-btn" onclick="copyTerminal(\'' + d.agent_id + '\')" title="Copy output">' +
+    '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">' +
+    '<rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/>' +
+    '</svg></button>';
   updateGlobalStatus();
 });
 
@@ -2226,8 +2298,6 @@ function confirmCancel() {
 
 // === CLEAR FOLDER (themed confirm) ===
 async function clearFolder(folder, listId) {
-  const ok = await appConfirm('Clear all files in ' + folder + '?');
-  if (!ok) return;
   try {
     const res = await fetch('/api/clear/' + folder, { method: 'POST' });
     const d = await res.json();
