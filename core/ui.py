@@ -705,13 +705,45 @@ def on_run_tests(data):
     sid = request.sid
 
     def run_test_streams():
+        global _agent_counter
+        # Create a coordinator panel to show any top-level test errors
+        socketio.emit("agent_created", {
+            "agent_id": "test-init",
+            "prompt": "Test Runner",
+            "is_test": True,
+        }, to=sid)
+
         try:
             # Import test definitions
             sys.path.insert(0, str(ROOT))
-            from tests import TESTS, clone_profile, cleanup_cloned_profiles
-            from tests import init_test_md, write_test_result, write_summary, append_test_md
-            from main import run_pipeline
-            from core.session import ChatGPTSession
+
+            # Check that required files exist before importing
+            tests_file = ROOT / "tests.py"
+            main_file = ROOT / "main.py"
+            if not tests_file.exists():
+                socketio.emit("agent_error", {
+                    "agent_id": "test-init",
+                    "error": "tests.py not found in project root. Cannot run tests.",
+                }, to=sid)
+                return
+            if not main_file.exists():
+                socketio.emit("agent_error", {
+                    "agent_id": "test-init",
+                    "error": "main.py not found in project root. Cannot run tests.",
+                }, to=sid)
+                return
+
+            try:
+                from tests import TESTS, clone_profile, cleanup_cloned_profiles
+                from tests import init_test_md, write_test_result, write_summary, append_test_md
+                from main import run_pipeline
+                from core.session import ChatGPTSession
+            except ImportError as ie:
+                socketio.emit("agent_error", {
+                    "agent_id": "test-init",
+                    "error": f"Import error: {ie}. Make sure tests.py and main.py are in the project root.",
+                }, to=sid)
+                return
 
             init_test_md()
 
@@ -925,17 +957,31 @@ def on_run_tests(data):
             total = len(results)
             passed_ct = sum(1 for r in results if r.get("passed"))
             failed_ct = total - passed_ct
-            print(f"\n{'='*50}")
-            print(f"TEST SUMMARY: {passed_ct}/{total} passed, {failed_ct} failed")
-            print(f"{'='*50}")
+
+            summary_text = f"\n{'='*50}\nTEST SUMMARY: {passed_ct}/{total} passed, {failed_ct} failed\n{'='*50}\n"
+            socketio.emit("agent_output", {
+                "agent_id": "test-init",
+                "stream": "stdout",
+                "text": summary_text,
+            }, to=sid)
+            print(summary_text, file=sys.__stdout__)
 
             write_summary(results)
 
-        except Exception as e:
-            socketio.emit("agent_error", {
-                "agent_id": "test-summary",
-                "error": f"Test runner error: {e}",
+            # Mark the coordinator panel as done
+            socketio.emit("agent_done", {
+                "agent_id": "test-init",
+                "success": failed_ct == 0,
             }, to=sid)
+
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            socketio.emit("agent_error", {
+                "agent_id": "test-init",
+                "error": f"Test runner error: {e}\n{tb}",
+            }, to=sid)
+            print(f"[TEST RUNNER ERROR] {e}\n{tb}", file=sys.__stderr__)
 
     threading.Thread(target=run_test_streams, daemon=True, name="test-coordinator").start()
 
@@ -1101,6 +1147,12 @@ html,body{height:100%;overflow:hidden;font-family:'DM Sans',sans-serif;backgroun
 .agent-panel.minimized .agent-status,
 .agent-panel.minimized .panel-input-bar{display:none}
 .agent-panel.minimized{height:34px!important;min-height:34px!important;overflow:visible;min-width:160px}
+.agent-panel.minimized .resize-handle.rh-n,
+.agent-panel.minimized .resize-handle.rh-s{display:none}
+.agent-panel.minimized .resize-handle.rh-ne,
+.agent-panel.minimized .resize-handle.rh-nw,
+.agent-panel.minimized .resize-handle.rh-se,
+.agent-panel.minimized .resize-handle.rh-sw{cursor:ew-resize}
 
 /* Resize handles on all edges and corners */
 .resize-handle{position:absolute;z-index:5}
@@ -1436,8 +1488,8 @@ html,body{height:100%;overflow:hidden;font-family:'DM Sans',sans-serif;backgroun
   <div class="confirm-box">
     <div class="confirm-msg" id="confirmMsg">Are you sure?</div>
     <div class="confirm-btns">
-      <button class="btn-cancel" onclick="confirmCancel()">Cancel</button>
       <button class="btn-confirm" id="confirmOk" onclick="confirmOk()">Delete</button>
+      <button class="btn-cancel" onclick="confirmCancel()">Cancel</button>
     </div>
   </div>
 </div>
@@ -1695,6 +1747,13 @@ socket.on('agent_running', d => {
   updateGlobalStatus();
 });
 
+function toggleMin(id) {
+  const el = agents[id]?.el;
+  if (el) {
+    el.classList.toggle('minimized');
+  }
+}
+
 function closePanel(id) {
   const a = agents[id];
   if (a) {
@@ -1741,6 +1800,11 @@ function makeDraggable(panel, handle) {
     if (!dragging) return;
     dragging = false;
     panel.style.zIndex = '';
+    // If user clicked header without dragging, toggle minimize
+    if (!moved) {
+      const id = panel.id;
+      if (id && agents[id]) toggleMin(id);
+    }
   });
 }
 
