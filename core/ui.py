@@ -728,16 +728,27 @@ def on_run_agent(data):
         except Exception as e:
             socketio.emit("agent_error", {"agent_id": agent_id, "error": str(e)}, to=sid)
         finally:
-            # Close the browser session -- force-close all pages first
+            # Close the browser session -- may already be closed by on_close_agent
             if session:
                 try:
-                    if session._ctx:
+                    # Try closing pages (may already be gone)
+                    if hasattr(session, '_ctx') and session._ctx:
                         for pg in session._ctx.pages:
                             try:
                                 pg.close()
                             except Exception:
                                 pass
+                except Exception:
+                    pass
+                try:
                     session.__exit__(None, None, None)
+                except Exception:
+                    pass
+                # Ensure Playwright process is dead
+                try:
+                    if hasattr(session, '_pw') and session._pw:
+                        session._pw.stop()
+                        session._pw = None
                 except Exception:
                     pass
             # Clean up the cloned browser profile
@@ -795,8 +806,7 @@ def on_followup_agent(data):
 
 @socketio.on("close_agent")
 def on_close_agent(data):
-    """Force-kill an agent: close browser pages, cancel the pipeline,
-    poison the queue, and clean up the browser profile immediately.
+    """Force-kill an agent: close browser, stop Playwright, clean up profiles.
     Works no matter what stage the agent is in.
     """
     agent_id = data.get("agent_id", "")
@@ -810,11 +820,13 @@ def on_close_agent(data):
     # 1. Set cancelled flag so the thread can check and bail out
     session_info["cancelled"] = True
 
-    # 2. Force-close all browser pages to abort any in-flight navigation,
-    #    wait_for_selector, prompt sending, etc. This causes Playwright
-    #    calls to throw, which the thread catches and exits.
+    # 2. Full Playwright teardown: close context, stop playwright, kill browser.
+    #    We call session.__exit__() which does both _ctx.close() and _pw.stop().
+    #    This is safe to call from another thread — it sends shutdown signals
+    #    to the browser process and Playwright subprocess.
     session = session_info.get("session")
     if session:
+        # Force-close all pages first to abort in-flight operations
         try:
             if hasattr(session, '_ctx') and session._ctx:
                 for pg in session._ctx.pages:
@@ -824,10 +836,24 @@ def on_close_agent(data):
                         pass
         except Exception:
             pass
-        # Also close the browser context itself
+
+        # Full shutdown: context + playwright process
         try:
-            if hasattr(session, '_ctx') and session._ctx:
-                session._ctx.close()
+            session.__exit__(None, None, None)
+        except Exception:
+            pass
+
+        # Belt-and-suspenders: if __exit__ didn't fully clean up,
+        # force-stop Playwright and null out references
+        try:
+            if hasattr(session, '_pw') and session._pw:
+                session._pw.stop()
+                session._pw = None
+        except Exception:
+            pass
+        try:
+            session._ctx = None
+            session._page = None
         except Exception:
             pass
 
@@ -840,7 +866,7 @@ def on_close_agent(data):
     # 4. Clean up the cloned browser profile directory
     def _cleanup_profile():
         import shutil as _shutil_close
-        time.sleep(1)  # Brief delay for file locks to release
+        time.sleep(2)  # Brief delay for file locks to release after browser death
         agent_profile = ROOT / ".browser_profiles" / agent_id
         if agent_profile.exists():
             try:

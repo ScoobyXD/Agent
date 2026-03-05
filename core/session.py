@@ -438,7 +438,7 @@ class ChatGPTSession:
                 else:
                     raise
 
-        time.sleep(0.5)
+        time.sleep(0.2)
 
         # Send
         send_btn = self._find_send_button()
@@ -449,7 +449,7 @@ class ChatGPTSession:
             print("[WARN] Send button not found, pressing Enter")
             page.keyboard.press("Enter")
 
-        time.sleep(S.POST_SEND_DELAY)
+        time.sleep(1)  # Brief settle before polling (override POST_SEND_DELAY)
         completed = self._wait_for_response()
 
         response = self._extract_last_response()
@@ -459,8 +459,7 @@ class ChatGPTSession:
 
     def _find_send_button(self):
         """Find the send button, with a brief retry for DOM settling."""
-        # After typing/file upload, the send button may take a moment to enable
-        for wait in range(6):  # up to 3 seconds
+        for wait in range(5):  # up to 1.5 seconds
             for sel in S.SEND_BUTTON_SELECTORS:
                 try:
                     btn = self._page.query_selector(sel)
@@ -468,7 +467,7 @@ class ChatGPTSession:
                         return btn
                 except Exception:
                     continue
-            time.sleep(0.5)
+            time.sleep(0.3)
         # Last resort: return any visible send button even if not "enabled"
         for sel in S.SEND_BUTTON_SELECTORS:
             try:

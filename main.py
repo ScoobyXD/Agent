@@ -1168,13 +1168,9 @@ def _escalate_to_thinking(prompt: str, md_path: Path, target: str,
                           session: 'ChatGPTSession' = None) -> bool:
     """Escalate a failed Instant run to the Thinking model.
 
-    If an existing session is provided (UI mode), reuses it by calling
-    switch_model() -- this avoids Playwright thread conflicts. If no
-    session is provided (CLI mode), creates a new one.
-
-    Sends the full raw_md transcript from the Instant run as context so
-    the Thinking model can see every prompt, response, code, output, and
-    error. Then runs the pipeline loop for escalation_retries more attempts.
+    Instead of pasting the transcript into the textarea (slow for large
+    transcripts), we attach the raw_md file directly. This is what a human
+    would do: open Thinking, attach the log, and say "fix this."
 
     Returns True if Thinking model achieves PASS, False otherwise.
     """
@@ -1187,54 +1183,55 @@ def _escalate_to_thinking(prompt: str, md_path: Path, target: str,
     print(f"  Instant model failed after max retries.")
     print(f"  Escalating to: {_S.ESCALATION_MODEL}")
     print(f"  Retries: {escalation_retries}")
-    print(f"  Strategy: Full raw_md context injection")
+    print(f"  Strategy: Attach raw_md file as context")
     print("=" * 60)
     print()
 
-    # Read the full raw_md transcript from the Instant run
-    transcript = ""
-    if md_path and md_path.exists():
-        try:
-            transcript = md_path.read_text(encoding="utf-8")
-            print(f"  [CONTEXT] Loaded {len(transcript)} chars from {md_path.name}")
-        except Exception as e:
-            print(f"  [WARN] Could not read transcript: {e}")
+    # Verify the raw_md file exists
+    if not md_path or not md_path.exists():
+        print("  [ERROR] No raw_md transcript found for escalation.")
+        return False
+
+    transcript_size = md_path.stat().st_size
+    print(f"  [CONTEXT] Attaching {md_path.name} ({transcript_size} bytes)")
 
     # Log escalation to raw_md
     append_to_log(md_path, "MODEL ESCALATION",
                   f"Escalating from {_S.DEFAULT_MODEL} to {_S.ESCALATION_MODEL}.\n"
-                  f"Injecting full transcript ({len(transcript)} chars) as context.\n"
+                  f"Attaching {md_path.name} ({transcript_size} bytes) as file.\n"
                   f"Giving Thinking model {escalation_retries} attempts.")
 
-    # Build the escalation prompt (full transcript, no truncation)
-    escalation_prompt = _build_escalation_prompt(prompt, transcript, target, remote_dir)
+    # Build a SHORT prompt — the heavy context is in the attached file
+    escalation_prompt = _build_escalation_prompt(prompt, target, remote_dir)
 
     detach = is_long_running(prompt)
 
+    # File to attach
+    escalation_files = [str(md_path)]
+
     # --- Session strategy ---
-    # If we have a live session (UI mode), reuse it by switching model.
-    # If not (CLI mode), create a new session for the Thinking model.
     owns_session = session is None
 
     if session is not None:
-        # Reuse existing session -- just switch the model and start a new chat
         session.switch_model(_S.ESCALATION_MODEL)
         return _run_escalation_loop(
             session, escalation_prompt, prompt, md_path, target,
             timeout, remote_dir, detach, escalation_retries, _S,
+            escalation_files=escalation_files,
         )
     else:
-        # CLI mode: create a fresh session
         with ChatGPTSession(headed=headed, profile_dir=profile_dir,
                             model=_S.ESCALATION_MODEL) as sess:
             return _run_escalation_loop(
                 sess, escalation_prompt, prompt, md_path, target,
                 timeout, remote_dir, detach, escalation_retries, _S,
+                escalation_files=escalation_files,
             )
 
 
 def _run_escalation_loop(sess, escalation_prompt, prompt, md_path, target,
-                         timeout, remote_dir, detach, escalation_retries, _S) -> bool:
+                         timeout, remote_dir, detach, escalation_retries, _S,
+                         escalation_files=None) -> bool:
     """Inner loop for escalation attempts. Extracted so it works with
     both reused sessions (UI) and fresh sessions (CLI)."""
 
@@ -1260,7 +1257,8 @@ def _run_escalation_loop(sess, escalation_prompt, prompt, md_path, target,
         if is_followup:
             response = sess.followup(current_prompt)
         else:
-            response = sess.prompt(current_prompt)
+            # First prompt: attach the raw_md file so ChatGPT reads the transcript
+            response = sess.prompt(current_prompt, files=escalation_files)
         is_followup = True
 
         append_to_log(md_path, f"Escalation Response {attempt} ({_S.ESCALATION_MODEL})",
@@ -1405,18 +1403,16 @@ def _run_escalation_loop(sess, escalation_prompt, prompt, md_path, target,
     return False
 
 
-def _build_escalation_prompt(original_prompt: str, transcript: str,
+def _build_escalation_prompt(original_prompt: str,
                              target: str, remote_dir: str = None) -> str:
-    """Build the context-rich prompt for the Thinking model.
+    """Build the prompt for the Thinking model.
 
-    Includes the full raw_md transcript from the Instant model's failed
-    attempts so Thinking can see exactly what was tried and what went wrong.
+    The full raw_md transcript is attached as a file, so this prompt is
+    SHORT — just instructions and the original task. No more pasting
+    15K+ chars into the textarea.
     """
     rdir = remote_dir or REMOTE_WORK_DIR
     target_desc = "Raspberry Pi 5 via SSH" if target == "raspi" else "this local machine"
-
-    # Send the full transcript -- Thinking model needs all context
-    transcript_trimmed = transcript
 
     if target == "raspi":
         exec_env = (
@@ -1437,14 +1433,11 @@ def _build_escalation_prompt(original_prompt: str, transcript: str,
         f"Code will be deployed and executed on: {target_desc}.\n"
         f"\n"
         f"=== IMPORTANT: PREVIOUS ATTEMPTS FAILED ===\n"
-        f"A faster model (Instant) already tried this task {3} times and FAILED.\n"
-        f"Below is the COMPLETE transcript of everything it tried -- every prompt,\n"
+        f"A faster model already tried this task multiple times and FAILED.\n"
+        f"I have attached the COMPLETE transcript as a .md file. It contains every prompt,\n"
         f"every response, every piece of code, and every execution output/error.\n"
-        f"Study this carefully. DO NOT repeat the same mistakes.\n"
+        f"Read the attached file carefully. DO NOT repeat the same mistakes.\n"
         f"Take a DIFFERENT approach if the previous one clearly wasn't working.\n"
-        f"\n"
-        f"=== FULL TRANSCRIPT FROM PREVIOUS ATTEMPTS ===\n"
-        f"{transcript_trimmed}\n"
         f"\n"
         f"=== EXECUTION ENVIRONMENT ===\n"
         f"{exec_env}\n"
@@ -1458,7 +1451,7 @@ def _build_escalation_prompt(original_prompt: str, transcript: str,
         f"\n"
         f"=== RULES ===\n"
         f"- SIMPLICITY FIRST: prefer the simplest, most direct solution.\n"
-        f"- Learn from the failed attempts above. Fix the root cause, don't just retry.\n"
+        f"- Learn from the failed attempts in the attached file. Fix the root cause, don't just retry.\n"
         f"- ASCII only in code output. No emojis.\n"
         f"- Print clear status messages so I can see what happened.\n"
         f"\n"
