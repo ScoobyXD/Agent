@@ -150,11 +150,10 @@ def _try_unfenced(text: str) -> List[CodeBlock]:
 
     Strategy:
     1. Find the first line that starts with a CODE_START_MARKER
-    2. Take everything from there to the end of the text
-    3. Strip trailing prose lines from the bottom
-
-    This works because ChatGPT always puts code AFTER its prose intro,
-    and any trailing prose ("Run this with...", "This will...") is short.
+    2. Walk BACKWARDS to include any contiguous code/comment lines above it
+       (this catches setup code like variable assignments before 'def')
+    3. Take everything from there to the end of the text
+    4. Strip trailing prose lines from the bottom
     """
     lines = text.split("\n")
 
@@ -181,15 +180,41 @@ def _try_unfenced(text: str) -> List[CodeBlock]:
     if code_start is None:
         return []
 
-    # Step 2: Take everything from code_start to end
+    # Step 2: Walk backwards to include contiguous code/comments above the marker.
+    # This catches patterns like:
+    #   # Generate Fibonacci numbers       <- comment, include
+    #   fibonacci_numbers = [0, 1]         <- assignment, include
+    #   for i in range(2, 15):             <- loop, include
+    #       fibonacci_numbers.append(...)  <- indented, include
+    #   def number_to_letter(n):           <- THIS is where code_start landed
+    while code_start > 0:
+        prev = lines[code_start - 1].strip()
+        if not prev:
+            # Blank line — peek further back. If there's code above the
+            # blank line, include the blank line and keep going.
+            if code_start >= 2:
+                above_blank = lines[code_start - 2].strip()
+                if above_blank and not _is_prose(above_blank) and above_blank.lower() not in KNOWN_LANG_LABELS:
+                    code_start -= 1
+                    continue
+            break
+        if prev.lower() in KNOWN_LANG_LABELS:
+            break  # Language label — don't include
+        if prev.lower() in ("copy code", "copy"):
+            break
+        if _is_prose(prev):
+            break  # Prose — stop
+        # It's a code or comment line — include it
+        code_start -= 1
+
+    # Step 3: Take everything from code_start to end
     candidate_lines = lines[code_start:]
 
-    # Step 3: Strip trailing prose from the bottom
-    # Walk backwards, removing lines that are clearly English prose
+    # Step 4: Strip trailing prose from the bottom
     while candidate_lines:
         last = candidate_lines[-1].strip()
         if not last:
-            candidate_lines.pop()  # remove trailing blank lines
+            candidate_lines.pop()
             continue
         if _is_prose(last):
             candidate_lines.pop()

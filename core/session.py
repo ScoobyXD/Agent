@@ -533,10 +533,12 @@ class ChatGPTSession:
     def _extract_last_response(self) -> str:
         """Extract the last assistant message with code fences intact.
 
-        Strategy: find every <pre><code> block in the message, extract
-        the code text with newlines from each one (using JS on the element
-        directly), detect the language, and build the response by combining
-        prose from inner_text() with properly fenced code blocks.
+        Strategy: Get the prose from inner_text(), extract code blocks
+        from <pre><code> elements in the DOM (with proper newlines),
+        then build the response by replacing the mangled code regions
+        in the prose with properly fenced code blocks.
+
+        If DOM code extraction fails, falls back to raw inner_text().
         """
         last = None
         for sel in S.ASSISTANT_MESSAGE_SELECTORS:
@@ -555,10 +557,79 @@ class ChatGPTSession:
             # No <pre><code> found — return raw inner_text
             return last.inner_text().strip()
 
-        # We have code blocks. Now build the full response:
-        # Get the full text, then replace mangled code with fenced versions.
+        # Build response by getting prose segments between code blocks.
+        # Instead of trying to find/replace code in inner_text (fragile),
+        # we extract prose-only text and interleave with fenced code blocks.
+        #
+        # The approach: get all text nodes that are NOT inside <pre> elements,
+        # then reconstruct: prose + fenced_code + prose + fenced_code + ...
+        try:
+            prose_segments = last.evaluate("""
+                el => {
+                    // Collect text that is NOT inside <pre> elements
+                    const segments = [];
+                    let currentSegment = '';
+                    const pres = new Set(el.querySelectorAll('pre'));
+
+                    function isInsidePre(node) {
+                        let parent = node.parentElement;
+                        while (parent && parent !== el) {
+                            if (pres.has(parent)) return true;
+                            parent = parent.parentElement;
+                        }
+                        return false;
+                    }
+
+                    // Walk all child elements of the message
+                    for (const child of el.children) {
+                        if (child.tagName === 'PRE' || pres.has(child)) {
+                            // This is a code block — save current prose segment
+                            if (currentSegment.trim()) {
+                                segments.push({type: 'prose', text: currentSegment.trim()});
+                            }
+                            currentSegment = '';
+                            segments.push({type: 'code'});
+                        } else {
+                            // This is prose
+                            currentSegment += child.innerText + '\\n';
+                        }
+                    }
+                    // Trailing prose after last code block
+                    if (currentSegment.trim()) {
+                        segments.push({type: 'prose', text: currentSegment.trim()});
+                    }
+                    return segments;
+                }
+            """)
+        except Exception:
+            # JS extraction failed — fall back to simple approach
+            prose_segments = None
+
+        if prose_segments:
+            # Interleave prose segments with fenced code blocks
+            parts = []
+            code_idx = 0
+            for seg in prose_segments:
+                if seg["type"] == "prose":
+                    parts.append(seg["text"])
+                elif seg["type"] == "code" and code_idx < len(code_blocks):
+                    block = code_blocks[code_idx]
+                    parts.append(f"```{block['language']}\n{block['code']}\n```")
+                    code_idx += 1
+            # Append any remaining code blocks not matched to segments
+            while code_idx < len(code_blocks):
+                block = code_blocks[code_idx]
+                parts.append(f"```{block['language']}\n{block['code']}\n```")
+                code_idx += 1
+            return "\n\n".join(parts)
+
+        # Fallback: just get inner_text and append fenced code blocks at the end.
+        # This is less pretty but guarantees the code is present and fenced.
         full_text = last.inner_text().strip()
-        return self._insert_fences(full_text, code_blocks)
+        fenced_blocks = []
+        for block in code_blocks:
+            fenced_blocks.append(f"```{block['language']}\n{block['code']}\n```")
+        return full_text + "\n\n" + "\n\n".join(fenced_blocks)
 
     def _get_code_blocks_from_dom(self, message_el) -> list:
         """Extract code text (with newlines) from each <pre><code> in the message.
@@ -694,90 +765,4 @@ class ChatGPTSession:
         except Exception:
             return ""
 
-    def _insert_fences(self, full_text: str, code_blocks: list) -> str:
-        """Replace mangled code in inner_text with properly fenced versions.
-
-        inner_text() produces something like:
-            "Here is the code:\npython\nCopy code\nimport math\ndef hello():\n..."
-        or sometimes all code on one line:
-            "Here is the code:\nPythonimport mathdef hello():    print('hi')"
-
-        We find where each code block appears (possibly mangled) and replace
-        it with a proper ```language ... ``` fenced block.
-        """
-        result = full_text
-
-        for block in code_blocks:
-            lang = block["language"]
-            code = block["code"]
-            fenced = f"\n```{lang}\n{code}\n```\n"
-
-            # The inner_text version may have:
-            # 1. "Python\nCopy code\n" prefix before the code
-            # 2. "Copy code\n" prefix
-            # 3. Language name glued to first line: "Pythonimport math..."
-            # 4. Code with newlines intact
-            # 5. Code as one long line (no newlines)
-
-            replaced = False
-
-            # Try finding "Language\nCopy code\n<first line of code>"
-            first_line = code.split("\n")[0].strip()
-            last_line = code.split("\n")[-1].strip()
-
-            # Pattern: "Python\nCopy code\n" or "python\nCopy code\n"
-            for prefix_pattern in [
-                f"{lang}\nCopy code\n",
-                f"{lang.capitalize()}\nCopy code\n",
-                f"{lang.upper()}\nCopy code\n",
-                "Copy code\n",
-            ]:
-                idx = result.find(prefix_pattern)
-                if idx >= 0:
-                    # Find end of code region: look for last line of code
-                    search_start = idx + len(prefix_pattern)
-                    end_idx = result.find(last_line, search_start)
-                    if end_idx >= 0:
-                        end_idx += len(last_line)
-                        result = result[:idx] + fenced + result[end_idx:]
-                        replaced = True
-                        break
-
-            if replaced:
-                continue
-
-            # Try finding code on one line (no newlines version)
-            code_no_nl = code.replace("\n", "")
-            # Check for language prefix glued on
-            for prefix in [lang.capitalize(), lang, lang.upper(), ""]:
-                search = prefix + code_no_nl[:80]
-                idx = result.find(search)
-                if idx >= 0:
-                    # Find end — look for last ~40 chars of the mangled code
-                    end_search = code_no_nl[-40:]
-                    end_idx = result.find(end_search, idx)
-                    if end_idx >= 0:
-                        end_idx += len(end_search)
-                    else:
-                        end_idx = idx + len(search)
-                    result = result[:idx] + fenced + result[end_idx:]
-                    replaced = True
-                    break
-
-            if replaced:
-                continue
-
-            # Try finding first line of code directly
-            if first_line and first_line in result:
-                idx = result.find(first_line)
-                end_idx = result.find(last_line, idx)
-                if end_idx >= 0:
-                    end_idx += len(last_line)
-                    result = result[:idx] + fenced + result[end_idx:]
-                    replaced = True
-
-            if not replaced:
-                # Last resort: append the fenced block
-                result = result + "\n" + fenced
-
-        return result
+    # (_insert_fences removed — response now built directly from DOM segments)
